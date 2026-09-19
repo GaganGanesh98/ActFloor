@@ -198,6 +198,11 @@ class Cfg:
     damp: float = 1e-2
     ratios: Tuple[float, ...] = (0.9, 0.75, 0.5, 0.3)
     floor: float = 0.25         # per-matrix rank floor for the greedy allocator
+    floors: Tuple[float, ...] = ()   # sweep the floor; () -> just `floor`.
+                                # `floor` is NOT part of calib_key(), so a sweep
+                                # reuses the cached factors and costs only
+                                # re-truncation + eval. Exp 1b always distils the
+                                # `floor` arm, so that value must be in the sweep.
     methods: Tuple[str, ...] = ("plain_svd", "act_aware_uniform", "act_aware_greedy")
     plain_svd_ratios: Optional[Tuple[float, ...]] = None  # None -> all of `ratios`
     dense_fallback: str = "original"   # "original" (prime) | "truncated" (1a)
@@ -1337,7 +1342,8 @@ def run_model(cfg: Cfg, results: Dict, out_path: str, do_1b: bool = True):
     # ---- Exp 1a: uniform arms -----------------------------------------------
     plain_ratios = cfg.plain_svd_ratios if cfg.plain_svd_ratios is not None else cfg.ratios
     uniform_rho: Dict[float, float] = {}
-    ranks_by_cfg: Dict[Tuple[str, float], Dict[str, int]] = {}
+    # keyed (method, ratio, floor); floor is None for the uniform arms
+    ranks_by_cfg: Dict[Tuple[str, float, Optional[float]], Dict[str, int]] = {}
 
     for method in cfg.methods:
         if method == "act_aware_greedy":
@@ -1350,7 +1356,7 @@ def run_model(cfg: Cfg, results: Dict, out_path: str, do_1b: bool = True):
             ppl = perplexity(model, eval_ids, DEV)
             if method == "act_aware_uniform":
                 uniform_rho[ratio] = rho
-            ranks_by_cfg[(method, ratio)] = ranks
+            ranks_by_cfg[(method, ratio, None)] = ranks
             rows.append({
                 "model": cfg.model_id, "method": method, "B_calib": 0,
                 "keep_ratio": ratio, "target_rho": None, "rho": rho,
@@ -1387,30 +1393,39 @@ def run_model(cfg: Cfg, results: Dict, out_path: str, do_1b: bool = True):
     # ---- Exp 1a': greedy at ρ matched to the uniform arm ---------------------
     if "act_aware_greedy" in cfg.methods:
         dense_tot = dense_params(shapes)
+        # `floor` is outside calib_key(), so sweeping it reuses the cached
+        # factors: each extra floor costs one re-truncation plus one eval.
+        floors = cfg.floors if cfg.floors else (cfg.floor,)
+        if cfg.floors and cfg.floor not in cfg.floors:
+            raise ValueError(
+                f"cfg.floor={cfg.floor} is not in cfg.floors={cfg.floors}; Exp 1b "
+                "distils the cfg.floor arm and would have no ranks to start from")
         for ratio in cfg.ratios:
             target = uniform_rho.get(ratio)
             if target is None:
                 target = rho_of(uniform_ranks(shapes, ratio), shapes)
-            ranks, spent = greedy_ranks(svals, shapes, target * dense_tot, floor=cfg.floor)
-            model, rho, stats = build_truncated(
-                cfg, cache, shapes, ranks, "act_aware_greedy", DEV)
-            fit_resident(model, DEV)
-            ppl = perplexity(model, eval_ids, DEV)
-            ranks_by_cfg[("act_aware_greedy", ratio)] = ranks
-            rows.append({
-                "model": cfg.model_id, "method": "act_aware_greedy", "B_calib": 0,
-                "keep_ratio": ratio, "target_rho": target, "rho": rho,
-                "ppl": ppl, "base_ppl": base, "d_ppl_pct": 100 * (ppl - base) / base,
-                "floor": cfg.floor, "ranks": {k: int(v) for k, v in ranks.items()},
-                **stats,
-            })
-            log(f"{'act_aware_greedy':18s} target_rho={target:.4f} rho={rho:.4f} "
-                f"ppl={ppl:12.3f} dppl={rows[-1]['d_ppl_pct']:+10.2f}%  "
-                f"keep_frac mean={stats['keep_frac_mean']:.2f} "
-                f"min={stats['keep_frac_min']:.2f}")
-            del model
-            sweep()
-            flush()
+            for fl in floors:
+                ranks, spent = greedy_ranks(svals, shapes, target * dense_tot, floor=fl)
+                model, rho, stats = build_truncated(
+                    cfg, cache, shapes, ranks, "act_aware_greedy", DEV)
+                fit_resident(model, DEV)
+                ppl = perplexity(model, eval_ids, DEV)
+                ranks_by_cfg[("act_aware_greedy", ratio, fl)] = ranks
+                rows.append({
+                    "model": cfg.model_id, "method": "act_aware_greedy", "B_calib": 0,
+                    "keep_ratio": ratio, "target_rho": target, "rho": rho,
+                    "ppl": ppl, "base_ppl": base, "d_ppl_pct": 100 * (ppl - base) / base,
+                    "floor": fl, "ranks": {k: int(v) for k, v in ranks.items()},
+                    **stats,
+                })
+                log(f"{'act_aware_greedy':18s} floor={fl:<5} target_rho={target:.4f} "
+                    f"rho={rho:.4f} ppl={ppl:12.3f} "
+                    f"dppl={rows[-1]['d_ppl_pct']:+10.2f}%  "
+                    f"keep_frac mean={stats['keep_frac_mean']:.2f} "
+                    f"min={stats['keep_frac_min']:.2f}")
+                del model
+                sweep()
+                flush()
 
     # ---- Exp 1b: LoRA distillation ------------------------------------------
     eval_at = sorted(s for s in cfg.b_calib if s > 0)
@@ -1419,9 +1434,12 @@ def run_model(cfg: Cfg, results: Dict, out_path: str, do_1b: bool = True):
         d_ratios = cfg.distil_ratios if cfg.distil_ratios is not None else cfg.ratios
         for method in cfg.distil_methods:
             for ratio in d_ratios:
-                ranks = ranks_by_cfg.get((method, ratio))
+                # a floor sweep produces one greedy arm per floor; distillation
+                # always runs the primary cfg.floor arm so 1b stays comparable
+                fl = cfg.floor if method == "act_aware_greedy" else None
+                ranks = ranks_by_cfg.get((method, ratio, fl))
                 if ranks is None:
-                    log(f"  no rank assignment for ({method}, {ratio}); skipping")
+                    log(f"  no rank assignment for ({method}, {ratio}, floor={fl}); skipping")
                     continue
                 model, rho, stats = build_truncated(cfg, cache, shapes, ranks, method, DEV)
                 log(f"distil {method} keep={ratio} rho={rho:.4f} "
@@ -1472,13 +1490,18 @@ def print_table(results: Dict):
         base = entry.get("base_ppl")
         print(f"\n### {model_id}   baseline ppl = {base:.4f}")
         rows = entry.get("rows", [])
-        keyf = lambda r: (r["method"], r["B_calib"], -r["rho"])
-        print(f"{'method':20s} {'B_calib':>7s} {'keep':>6s} {'rho':>8s} "
-              f"{'ppl':>13s} {'d_ppl %':>12s} {'dense kept':>11s}")
-        print("-" * 84)
+        keyf = lambda r: (r["method"], r["B_calib"],
+                          r.get("floor") if r.get("floor") is not None else -1.0,
+                          -r["rho"])
+        print(f"{'method':20s} {'B_calib':>7s} {'keep':>6s} {'floor':>6s} "
+              f"{'rho':>8s} {'ppl':>13s} {'d_ppl %':>12s} {'dense kept':>11s}")
+        print("-" * 91)
         for r in sorted(rows, key=keyf):
+            fl = r.get("floor")
             print(f"{r['method']:20s} {r['B_calib']:>7d} "
-                  f"{(r.get('keep_ratio') or 0):>6.2f} {r['rho']:>8.4f} "
+                  f"{(r.get('keep_ratio') or 0):>6.2f} "
+                  f"{(f'{fl:.2f}' if fl is not None else '-'):>6s} "
+                  f"{r['rho']:>8.4f} "
                   f"{r['ppl']:>13.3f} {r['d_ppl_pct']:>+12.2f} "
                   f"{r.get('n_kept_dense', 0):>11d}")
         for c in entry.get("sanity_end_to_end", []):
@@ -1494,11 +1517,16 @@ def markdown_table(results: Dict) -> str:
                 or "rows" not in entry:
             continue
         out.append(f"\n**{model_id}** — baseline ppl {entry['base_ppl']:.4f}\n")
-        out.append("| method | B_calib | keep | rho | ppl | Δ ppl |")
-        out.append("|---|---|---|---|---|---|")
-        for r in sorted(entry["rows"], key=lambda r: (r["method"], r["B_calib"], -r["rho"])):
+        out.append("| method | B_calib | keep | floor | rho | ppl | Δ ppl |")
+        out.append("|---|---|---|---|---|---|---|")
+        keyf = lambda r: (r["method"], r["B_calib"],
+                          r.get("floor") if r.get("floor") is not None else -1.0,
+                          -r["rho"])
+        for r in sorted(entry["rows"], key=keyf):
+            fl = r.get("floor")
             out.append(f"| {r['method']} | {r['B_calib']} | "
-                       f"{(r.get('keep_ratio') or 0):.2f} | {r['rho']:.4f} | "
+                       f"{(r.get('keep_ratio') or 0):.2f} | "
+                       f"{f'{fl:.2f}' if fl is not None else '—'} | {r['rho']:.4f} | "
                        f"{r['ppl']:.3f} | {r['d_ppl_pct']:+.2f}% |")
     return "\n".join(out)
 
@@ -1519,11 +1547,6 @@ SMOKE = Cfg(
     distil_ratios=(0.5,),
     scratch=DEFAULT_SMOKE_SCRATCH, drive=None,
     out_name="smoke.json",
-    # Caching only, no effect on any number: the (U,S,Z) act-aware cache is
-    # ~1.8 GiB for 0.5B and caching the plain-SVD factors too roughly doubles
-    # that. Recomputing plain SVD on demand keeps the smoke test runnable on a
-    # laptop with a couple of GiB free. CFG_7B sets this for the same reason.
-    cache_plain=False,
 )
 
 smoke_results: Dict = {}
@@ -1567,10 +1590,19 @@ CFG_1_5B = Cfg(
     ndistil=512, distil_seqlen=256,
     ratios=(0.9, 0.75, 0.5, 0.3),
     floor=0.25,
+    # Closes the floor-sensitivity caveat in findings-exp1a-prime-nonuniform.md:
+    # a single arbitrary floor does not give a minimum of Phi(rho) over floors.
+    # `floor` is outside calib_key(), so this reuses the cached factors and costs
+    # only re-truncation + eval (4 ratios x 3 floors = 12 greedy arms, not 4).
+    floors=(0.1, 0.25, 0.4),
     b_calib=(0, 100, 300, 500),
     distil_methods=("act_aware_greedy",),
     distil_ratios=(0.75, 0.5, 0.3),
-    cache_plain=True, drive_factors=True,
+    cache_plain=True,
+    # Drive mirroring off: the factor cache is 12.2 GiB with cache_plain=True,
+    # which does not fit a 15 GB free Drive and would write at a few MB/s.
+    # Results still go to Drive; only the regenerable factors stay local.
+    drive_factors=False,
 )
 
 if mount_drive(CFG_1_5B):
@@ -1603,6 +1635,9 @@ CFG_7B = Cfg(
     ndistil=512, distil_seqlen=256,
     ratios=(0.9, 0.75, 0.5, 0.3),
     floor=0.25,
+    # No floor sweep at 7B: each extra greedy arm re-reads ~31 GiB of factors
+    # from disk and re-streams the eval, so 8 extra arms would add hours.
+    floors=(),
     b_calib=(0, 100, 300, 500),
     plain_svd_ratios=(0.5,),      # baseline + protocol check only; SVD is costly here
     distil_methods=("act_aware_greedy",),
