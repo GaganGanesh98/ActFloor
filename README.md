@@ -15,6 +15,43 @@ either one, then run:
 
 jupytext rewrites whichever file is older. Never hand-edit both — sync instead.
 
+### Round-trip rule for hosted runtimes (Colab / Kaggle)
+
+**Local is authoritative. A hosted runtime gets a read-only copy of the code and
+never sends the notebook back.**
+
+Hosted runtimes rewrite `.ipynb` on save — outputs, execution counts, and in
+Colab's case the metadata block that holds the `jupytext.formats` key and the
+kernelspec. If such a file is copied back over the local one, the pairing
+silently dies and the two files drift apart with no error.
+
+So:
+
+1. Code changes happen **locally only**, then `jupytext --sync`, then commit.
+2. The runtime receives code by `git clone` (or by uploading `exp1_gpu_src.py`).
+   Treat everything it holds as read-only.
+3. Only **`results/*.json` and run logs** come back. Those are data, not code,
+   and round-trip cleanly.
+4. **Never** copy a runtime `.ipynb` over the local one.
+
+If a fix genuinely has to be made inside the runtime, the sync-back is explicit
+and must not be skipped:
+
+```sh
+# after downloading the runtime's notebook to /tmp/runtime.ipynb
+python -m jupytext --to py:percent /tmp/runtime.ipynb -o /tmp/runtime_src.py
+diff exp1_gpu_src.py /tmp/runtime_src.py      # review EVERY hunk by hand
+# apply the wanted hunks to exp1_gpu_src.py locally, then:
+.venv/bin/python -m jupytext --sync exp1_gpu_src.py
+git diff -- exp1_gpu.ipynb exp1_gpu_src.py    # both files must move together
+```
+
+Check the pairing survived at any time with:
+
+```sh
+.venv/bin/python -m jupytext --sync exp1_gpu.ipynb   # must say "Unchanged" twice
+```
+
 ## Reproducing the smoke test (CPU, no GPU needed)
 
 The default `python3` on this machine is 3.14 and PyTorch has no 3.14 wheels, so
