@@ -32,11 +32,54 @@ Does NOT check:
     a full calibration and baseline before run_model reaches the greedy
     block, which is not worth the time; it is checked by construction only.
 
-Usage:  .venv/bin/python validate_floors.py
+Usage
+-----
+    .venv/bin/python validate_floors.py
+    .venv/bin/python validate_floors.py --floors 0.4,0.55,0.7,0.85
+    .venv/bin/python validate_floors.py --floors 0.4,0.55,0.7 --skip-1b
+
+--floors   comma-separated rank floors to sweep   (default 0.1,0.25,0.4)
+--ratios   comma-separated keep ratios            (default 0.75,0.5)
+--floor    the floor Exp 1b distils; must be one of --floors. Defaults to
+           0.25 when that is in the sweep, otherwise the first floor given.
+--skip-1b  skip the LoRA distillation arm (~25 s) when only probing floors.
+
+Unknown arguments are an error, not ignored.
 """
+import argparse
 import os
 import pathlib
-import sys
+
+
+def _csv_floats(s: str):
+    try:
+        vals = tuple(float(x) for x in s.split(",") if x.strip())
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a comma-separated float list: {s!r}")
+    if not vals:
+        raise argparse.ArgumentTypeError("empty list")
+    return vals
+
+
+_ap = argparse.ArgumentParser(description="Check the Cfg.floors sweep on CPU.")
+_ap.add_argument("--floors", type=_csv_floats, default=(0.1, 0.25, 0.4))
+_ap.add_argument("--ratios", type=_csv_floats, default=(0.75, 0.5))
+_ap.add_argument("--floor", type=float, default=None,
+                 help="floor Exp 1b distils; must be in --floors")
+_ap.add_argument("--skip-1b", action="store_true", dest="skip_1b")
+ARGS = _ap.parse_args()          # unknown args -> SystemExit(2), never ignored
+
+FLOORS = ARGS.floors
+RATIOS = ARGS.ratios
+if ARGS.floor is not None:
+    PRIMARY = ARGS.floor
+    if PRIMARY not in FLOORS:
+        _ap.error(f"--floor {PRIMARY} is not in --floors {FLOORS}; Exp 1b would "
+                  "have no ranks to start from")
+else:
+    PRIMARY = 0.25 if 0.25 in FLOORS else FLOORS[0]
+print(f"floors={FLOORS}  ratios={RATIOS}  primary floor (Exp 1b)={PRIMARY}"
+      f"{'  [1b skipped]' if ARGS.skip_1b else ''}\n")
 
 HERE = pathlib.Path(__file__).resolve().parent
 SRC = HERE / "exp1_gpu_src.py"
@@ -67,9 +110,9 @@ print("guard present in source; condition confirmed (not executed here)\n")
 CFG = Cfg(
     model_id="Qwen/Qwen2.5-0.5B-Instruct",
     seqlen=256, ncalib=8, neval=4, ndistil=16, distil_seqlen=128,
-    ratios=(0.75, 0.5), b_calib=(0, 4), topk=64,
+    ratios=RATIOS, b_calib=(0,) if ARGS.skip_1b else (0, 4), topk=64,
     methods=("act_aware_greedy",),          # no plain SVD -> no new cache writes
-    floor=0.25, floors=(0.1, 0.25, 0.4),
+    floor=PRIMARY, floors=FLOORS,
     distil_methods=("act_aware_greedy",), distil_ratios=(0.5,),
     scratch=DEFAULT_SMOKE_SCRATCH, drive=None,
     out_name="floors_check.json",
@@ -79,7 +122,7 @@ cached = os.path.join(CFG.scratch, CFG.calib_key())
 print(f"factors cached: {os.path.isdir(cached)}  ({cached})\n")
 
 res = {}
-run_model(CFG, res, os.path.join(CFG.scratch, CFG.out_name), do_1b=True)
+run_model(CFG, res, os.path.join(CFG.scratch, CFG.out_name), do_1b=not ARGS.skip_1b)
 print_table(res)
 
 # --- 3. assert the shape of what came back -----------------------------------
@@ -95,10 +138,14 @@ assert len({(r["keep_ratio"], r["floor"]) for r in greedy0}) == len(greedy0), \
 print("every (ratio, floor) arm is distinct                        OK")
 
 distil = [r for r in rows if r["B_calib"] > 0]
-assert distil, "Exp 1b produced no rows — the ranks_by_cfg lookup missed"
-stray = [r for r in distil if r["floor"] != CFG.floor]
-assert not stray, f"Exp 1b distilled a non-primary floor: {[r['floor'] for r in stray]}"
-print(f"Exp 1b distilled only floor={CFG.floor} ({len(distil)} rows)          OK")
+if ARGS.skip_1b:
+    assert not distil, "--skip-1b was given but Exp 1b rows appeared"
+    print("Exp 1b skipped by request                                   --")
+else:
+    assert distil, "Exp 1b produced no rows — the ranks_by_cfg lookup missed"
+    stray = [r for r in distil if r["floor"] != CFG.floor]
+    assert not stray, f"Exp 1b distilled a non-primary floor: {[r['floor'] for r in stray]}"
+    print(f"Exp 1b distilled only floor={CFG.floor} ({len(distil)} rows)          OK")
 
 # monotonicity is NOT asserted: a higher floor is not guaranteed to be better at
 # every rho, and that is one of the things the sweep exists to measure.
