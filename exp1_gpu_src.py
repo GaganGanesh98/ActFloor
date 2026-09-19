@@ -1675,8 +1675,14 @@ CFG_1_5B = Cfg(
     # Closes the floor-sensitivity caveat in findings-exp1a-prime-nonuniform.md:
     # a single arbitrary floor does not give a minimum of Phi(rho) over floors.
     # `floor` is outside calib_key(), so this reuses the cached factors and costs
-    # only re-truncation + eval (4 ratios x 3 floors = 12 greedy arms, not 4).
-    floors=(0.1, 0.25, 0.4),
+    # only re-truncation + eval (4 ratios x 2 floors = 8 greedy arms, not 4).
+    #
+    # 0.1 was dropped after the 0.5B sweep: it starves matrices to near-zero rank
+    # and was catastrophic at every rho tested -- +41101% d_ppl at rho=0.6321 and
+    # +723% at rho=0.8042, against +973%/+295% for floor 0.25 at the same targets.
+    # It was never the minimum, so it would cost 4 greedy arms of T4 time to
+    # re-confirm a result already established at 0.5B.
+    floors=(0.25, 0.4),
     b_calib=(0, 100, 300, 500),
     distil_methods=("act_aware_greedy",),
     distil_ratios=(0.75, 0.5, 0.3),
