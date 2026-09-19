@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store
+
+# editor/backup noise (kept on disk, not tracked)
+*.bak
+
+# Scratch caches: factor caches (U,S,Z), tokenised text, teacher logits, and the
+# results JSON the driver flushes next to them. Huge and fully regenerable from
+# the calibration pass, so never committed.
+#
+# Covers the default repo-local scratch and anything EFFORTGAP_SCRATCH points at
+# inside the repo. results/ is deliberately NOT ignored — it holds the committed
+# experiment outputs the findings-*.md files cite.
+effortgap/
+effortgap_*/
