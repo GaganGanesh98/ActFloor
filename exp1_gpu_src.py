@@ -94,7 +94,7 @@ print("deps ok")
 # --- imports, preflight ------------------------------------------------------
 import gc, hashlib, json, math, os, shutil, time
 from dataclasses import dataclass, asdict, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -890,8 +890,32 @@ def uniform_ranks(shapes: Dict[str, List[int]], ratio: float) -> Dict[str, int]:
     return {k: max(1, int(round(ratio * min(m_, n_)))) for k, (m_, n_) in shapes.items()}
 
 
+class Allocation(NamedTuple):
+    """What the allocator decided, and whether it could honour the budget.
+
+    The floor is spent before any budget check, so when `floor_cost > budget`
+    every greedy increment is skipped and `ranks` is the bare floor — an
+    allocation that costs MORE than was asked for. That is not an operating
+    point at the requested effort and must not be reported as one, so the fact
+    travels with the result instead of being recomputed (or forgotten) by the
+    caller."""
+    ranks: Dict[str, int]
+    spent: float            # flops the returned allocation actually costs
+    floor_cost: float       # flops the per-matrix floor alone costs
+    budget: float           # the budget it was asked to respect
+
+    @property
+    def feasible(self) -> bool:
+        return self.floor_cost <= self.budget
+
+    @property
+    def floor_budget_frac(self) -> float:
+        """Floor cost as a fraction of budget. > 1 means infeasible."""
+        return self.floor_cost / self.budget if self.budget else float("inf")
+
+
 def greedy_ranks(svals: Dict[str, torch.Tensor], shapes: Dict[str, List[int]],
-                 budget: float, floor: float = 0.0):
+                 budget: float, floor: float = 0.0) -> Allocation:
     """Exact greedy for the separable surrogate.
 
     error_i(r_i) = Σ_{j>r_i} σ_ij²      flops_i(r_i) = r_i (m_i + n_i)
@@ -901,9 +925,15 @@ def greedy_ranks(svals: Dict[str, torch.Tensor], shapes: Dict[str, List[int]],
     sorting all increments by σ_ij²/(m_i+n_i) descending is optimal. `floor` is
     a per-matrix minimum rank: without it the greedy starves whole matrices to
     rank ~0, which is catastrophic end-to-end because error compounds through
-    depth even when the layer-local error removed is small."""
+    depth even when the layer-local error removed is small.
+
+    A floor large enough to exceed `budget` on its own is NOT clamped or
+    rescaled — doing so would invent an operating point the allocator never
+    chose. The bare floor is returned and flagged infeasible via the result, so
+    a sweep can walk past it and record where feasibility breaks."""
     rank = {k: max(1, int(round(floor * min(m_, n_)))) for k, (m_, n_) in shapes.items()}
     spent = sum(rank[k] * (shapes[k][0] + shapes[k][1]) for k in shapes)
+    floor_cost = spent          # what the floor alone costs, before any greedy
     cand = []
     for k, (m_, n_) in shapes.items():
         w = m_ + n_
@@ -917,7 +947,7 @@ def greedy_ranks(svals: Dict[str, torch.Tensor], shapes: Dict[str, List[int]],
             continue
         rank[k] += 1
         spent += w
-    return rank, spent
+    return Allocation(rank, spent, floor_cost, budget)
 
 
 def rho_of(ranks: Dict[str, int], shapes: Dict[str, List[int]]) -> float:
@@ -1405,7 +1435,8 @@ def run_model(cfg: Cfg, results: Dict, out_path: str, do_1b: bool = True):
             if target is None:
                 target = rho_of(uniform_ranks(shapes, ratio), shapes)
             for fl in floors:
-                ranks, spent = greedy_ranks(svals, shapes, target * dense_tot, floor=fl)
+                alloc = greedy_ranks(svals, shapes, target * dense_tot, floor=fl)
+                ranks = alloc.ranks
                 model, rho, stats = build_truncated(
                     cfg, cache, shapes, ranks, "act_aware_greedy", DEV)
                 fit_resident(model, DEV)
@@ -1416,6 +1447,10 @@ def run_model(cfg: Cfg, results: Dict, out_path: str, do_1b: bool = True):
                     "keep_ratio": ratio, "target_rho": target, "rho": rho,
                     "ppl": ppl, "base_ppl": base, "d_ppl_pct": 100 * (ppl - base) / base,
                     "floor": fl, "ranks": {k: int(v) for k, v in ranks.items()},
+                    # the floor is spent before any budget check, so a large
+                    # enough floor returns an allocation that BREAKS the budget
+                    "budget_feasible": alloc.feasible,
+                    "floor_budget_frac": alloc.floor_budget_frac,
                     **stats,
                 })
                 log(f"{'act_aware_greedy':18s} floor={fl:<5} target_rho={target:.4f} "
@@ -1423,6 +1458,12 @@ def run_model(cfg: Cfg, results: Dict, out_path: str, do_1b: bool = True):
                     f"dppl={rows[-1]['d_ppl_pct']:+10.2f}%  "
                     f"keep_frac mean={stats['keep_frac_mean']:.2f} "
                     f"min={stats['keep_frac_min']:.2f}")
+                if not alloc.feasible:
+                    log(f"  INFEASIBLE: floor={fl} alone costs "
+                        f"{alloc.floor_budget_frac:.1%} of the budget for "
+                        f"target_rho={target:.4f}; every greedy increment was "
+                        f"skipped and this row is NOT an operating point at "
+                        f"keep={ratio}")
                 del model
                 sweep()
                 flush()
@@ -1482,6 +1523,18 @@ def run_model(cfg: Cfg, results: Dict, out_path: str, do_1b: bool = True):
 # ## Reporting
 
 # %%
+def row_infeasible(r: Dict) -> bool:
+    """True when a row is not an operating point at its stated keep ratio.
+
+    Primary signal is the allocator's own verdict. Rows written before
+    `budget_feasible` existed do not carry it, so fall back to the observable
+    symptom: effort actually spent exceeding the effort requested."""
+    if r.get("budget_feasible") is False:
+        return True
+    target = r.get("target_rho")
+    return target is not None and r.get("rho", 0.0) > target + 1e-9
+
+
 def print_table(results: Dict):
     for model_id, entry in results.items():
         if model_id.startswith("_") or not isinstance(entry, dict) \
@@ -1496,14 +1549,28 @@ def print_table(results: Dict):
         print(f"{'method':20s} {'B_calib':>7s} {'keep':>6s} {'floor':>6s} "
               f"{'rho':>8s} {'ppl':>13s} {'d_ppl %':>12s} {'dense kept':>11s}")
         print("-" * 91)
+        n_infeasible = 0
         for r in sorted(rows, key=keyf):
             fl = r.get("floor")
+            bad = row_infeasible(r)
+            n_infeasible += bad
+            frac = r.get("floor_budget_frac")
+            flag = ""
+            if bad:
+                over = f" floor={frac:.0%} of budget" if frac is not None else ""
+                flag = f"   << NOT AN OPERATING POINT:{over or ' rho exceeds target'}"
             print(f"{r['method']:20s} {r['B_calib']:>7d} "
                   f"{(r.get('keep_ratio') or 0):>6.2f} "
                   f"{(f'{fl:.2f}' if fl is not None else '-'):>6s} "
                   f"{r['rho']:>8.4f} "
                   f"{r['ppl']:>13.3f} {r['d_ppl_pct']:>+12.2f} "
-                  f"{r.get('n_kept_dense', 0):>11d}")
+                  f"{r.get('n_kept_dense', 0):>11d}{flag}")
+        if n_infeasible:
+            print(f"\n  {n_infeasible} row(s) flagged: the rank floor alone "
+                  "exceeded the FLOP budget, so the allocator returned the bare "
+                  "floor and spent MORE than the target rho. Those rows are not "
+                  "results at their stated keep ratio and must not be read as "
+                  "operating points.")
         for c in entry.get("sanity_end_to_end", []):
             print(f"  protocol check keep={c['keep_ratio']}: act-aware "
                   f"{c['act_aware_ppl']:.3f} vs plain SVD {c['plain_svd_ppl']:.3f} "
@@ -1517,17 +1584,32 @@ def markdown_table(results: Dict) -> str:
                 or "rows" not in entry:
             continue
         out.append(f"\n**{model_id}** — baseline ppl {entry['base_ppl']:.4f}\n")
-        out.append("| method | B_calib | keep | floor | rho | ppl | Δ ppl |")
-        out.append("|---|---|---|---|---|---|---|")
+        out.append("| method | B_calib | keep | floor | rho | ppl | Δ ppl | budget |")
+        out.append("|---|---|---|---|---|---|---|---|")
         keyf = lambda r: (r["method"], r["B_calib"],
                           r.get("floor") if r.get("floor") is not None else -1.0,
                           -r["rho"])
+        any_bad = False
         for r in sorted(entry["rows"], key=keyf):
             fl = r.get("floor")
+            bad = row_infeasible(r)
+            any_bad |= bad
+            frac = r.get("floor_budget_frac")
+            if bad:
+                note = (f"**INFEASIBLE** (floor = {frac:.0%} of budget)"
+                        if frac is not None else "**INFEASIBLE** (rho > target)")
+            else:
+                note = "ok"
             out.append(f"| {r['method']} | {r['B_calib']} | "
                        f"{(r.get('keep_ratio') or 0):.2f} | "
                        f"{f'{fl:.2f}' if fl is not None else '—'} | {r['rho']:.4f} | "
-                       f"{r['ppl']:.3f} | {r['d_ppl_pct']:+.2f}% |")
+                       f"{r['ppl']:.3f} | {r['d_ppl_pct']:+.2f}% | {note} |")
+        if any_bad:
+            out.append("")
+            out.append("> Rows marked **INFEASIBLE** are not operating points at "
+                       "their stated keep ratio: the per-matrix rank floor alone "
+                       "exceeded the FLOP budget, so the allocator returned the "
+                       "bare floor and spent more effort than the target ρ.")
     return "\n".join(out)
 
 
