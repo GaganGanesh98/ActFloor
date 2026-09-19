@@ -25,6 +25,7 @@ optimal for a surrogate, not for the true objective. It is still strictly strong
 uniform, which is the point of the experiment.
 """
 import argparse, gc, json, math, os, time
+from typing import NamedTuple
 import torch, torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -52,15 +53,44 @@ def perplexity(model, ids, seqlen, nseq):
         nll += o.loss.item()*(c.shape[1]-1); ntok += c.shape[1]-1
     return math.exp(nll/ntok)
 
+class Allocation(NamedTuple):
+    """What the allocator decided, and whether it could honour the budget.
+
+    The floor is spent before any budget check, so when `floor_cost > budget`
+    every greedy increment is skipped and `ranks` is the bare floor — an
+    allocation costing MORE than was asked for. That is not an operating point
+    at the requested effort, so the fact travels with the result rather than
+    being silently dropped."""
+    ranks: dict
+    spent: float            # flops the returned allocation actually costs
+    floor_cost: float       # flops the per-matrix floor alone costs
+    budget: float           # the budget it was asked to respect
+
+    @property
+    def feasible(self):
+        return self.floor_cost <= self.budget
+
+    @property
+    def floor_budget_frac(self):
+        """Floor cost as a fraction of budget. > 1 means infeasible."""
+        return self.floor_cost / self.budget if self.budget else float("inf")
+
+
 def allocate(specs, budget, floor=0.0):
     """Greedy allocation on the separable surrogate, with a per-matrix rank FLOOR.
 
     Without a floor the greedy starves whole matrices to rank 0. That is catastrophic
     end-to-end even when the layer-local error it removes is small, because errors
     compound multiplicatively through depth. Any real adversary imposes a floor, so
-    running without one is a different strawman, not a stronger adversary."""
+    running without one is a different strawman, not a stronger adversary.
+
+    A floor that exceeds `budget` on its own is NOT clamped or rescaled — that would
+    invent an operating point the allocator never chose. The bare floor is returned
+    and flagged infeasible on the result, so a sweep can walk past it and record
+    where feasibility breaks."""
     rank = {k: max(1, int(round(floor*min(sp["m"], sp["n"])))) for k, sp in specs.items()}
     spent = sum(rank[k]*(specs[k]["m"]+specs[k]["n"]) for k in specs)
+    floor_cost = spent          # what the floor alone costs, before any greedy
     cand = []
     for k, sp in specs.items():
         w = sp["m"] + sp["n"]
@@ -71,7 +101,7 @@ def allocate(specs, budget, floor=0.0):
         w = specs[k]["m"] + specs[k]["n"]
         if spent + w > budget: continue
         rank[k] += 1; spent += w
-    return rank, spent
+    return Allocation(rank, spent, floor_cost, budget)
 
 def main():
     ap = argparse.ArgumentParser()
@@ -116,7 +146,8 @@ def main():
 
     rows = []
     for target in [float(x) for x in a.rhos.split(",")]:
-        rank, spent = allocate(specs, target*dense, floor=a.floor)
+        alloc = allocate(specs, target*dense, floor=a.floor)
+        rank = alloc.ranks
         cost = 0
         for k, m in lins.items():
             d = torch.load(os.path.join(a.svddir, k.replace(".", "_")+".pt"))
@@ -137,10 +168,19 @@ def main():
                      "d_ppl_pct": 100*(ppl-base)/base,
                      "keep_frac_min": min(rr), "keep_frac_max": max(rr),
                      "keep_frac_mean": sum(rr)/len(rr),
+                     # the floor is spent before any budget check, so a large
+                     # enough floor returns an allocation that BREAKS the budget
+                     "budget_feasible": alloc.feasible,
+                     "floor_budget_frac": alloc.floor_budget_frac,
                      "ranks": {k: rank[k] for k in lins}})
         log(f"floor={a.floor} target_rho={target:<7} actual_rho={rho:.4f} ppl={ppl:9.3f} "
             f"dppl={rows[-1]['d_ppl_pct']:+9.2f}%  keep_frac "
             f"min={min(rr):.2f} mean={sum(rr)/len(rr):.2f} max={max(rr):.2f}")
+        if not alloc.feasible:
+            log(f"  INFEASIBLE: floor={a.floor} alone costs "
+                f"{alloc.floor_budget_frac:.1%} of the budget for target_rho="
+                f"{target}; every greedy increment was skipped, so this row is "
+                f"NOT an operating point at that rho")
         json.dump({"model": a.model, "base_ppl": base, "rows": rows}, open(a.out, "w"), indent=1)
     for k, m in lins.items(): m.weight.data = orig[k]
     log("done -> " + a.out)
