@@ -61,7 +61,7 @@ import torch.nn.functional as F
 from exp1_gpu_src import (  # noqa: E402
     Cfg, Cache, CFG_1_5B, DEV, log, sweep,
     make_splits, run_calibration, build_truncated,
-    uniform_ranks, greedy_ranks, rho_of, dense_params,
+    uniform_ranks, greedy_ranks, rho_of, dense_params, adapter_root,
     AutoModelForCausalLM, AutoTokenizer,
 )
 
@@ -96,33 +96,65 @@ class PromptSpec:
 # Model reconstruction -- reuses the experiment's own machinery
 # ---------------------------------------------------------------------------
 
+def discover_adapters(root: str, cache_key: str, method: str, ratio: float,
+                      floor: Optional[float],
+                      ranks: Dict[str, int]) -> Dict[int, str]:
+    """Find every saved checkpoint for one arm: {B_calib: path}.
+
+    Each manifest records the rank assignment its adapter was trained on. That
+    is checked against the ranks recomputed here and a mismatch is refused, not
+    warned about: an adapter applied to a differently-truncated base is silently
+    wrong, and silently wrong is the failure mode this whole module exists to
+    rule out.
+    """
+    fl = "none" if floor is None else f"{floor}"
+    arm = os.path.join(root, cache_key, f"{method}_keep{ratio}_floor{fl}")
+    if not os.path.isdir(arm):
+        return {}
+    found: Dict[int, str] = {}
+    for name in sorted(os.listdir(arm)):
+        if not name.startswith("B"):
+            continue
+        path = os.path.join(arm, name)
+        mpath = os.path.join(path, "manifest.json")
+        if not os.path.isfile(mpath):
+            log(f"  adapter at {path} has no manifest -- skipped")
+            continue
+        man = json.load(open(mpath))
+        if {k: int(v) for k, v in man["ranks"].items()} != {k: int(v) for k, v in ranks.items()}:
+            raise RuntimeError(
+                f"adapter {path} was trained on a different rank assignment "
+                f"than the one rebuilt here -- refusing to use it")
+        found[int(man["B_calib"])] = path
+    return found
+
+
 def rebuild_hollow(cfg: Cfg, cache: Cache, shapes, svals,
                    method: str, ratio: float, floor: Optional[float],
-                   adapter_path: Optional[str] = None):
-    """Rebuild one hollow model. Returns (model, rho, stats, feasible).
+                   adapters: Optional[Dict[int, str]] = None,
+                   b_calib: int = 0):
+    """Rebuild one hollow model at one calibration budget.
 
-    B_calib > 0 is NOT reachable here. The distilled arms in
-    results/exp1_gpu_results.json were LoRA adapters that died with the Colab
-    runtime (drive_factors=False), and re-deriving them is training, which this
-    module does not do. Pass `adapter_path` once the improvement run saves them;
-    until then phase 1 covers the 16 B_calib=0 rows and the 9 distilled rows
-    are deferred.
+    `adapters` maps B_calib -> checkpoint directory, as written by
+    save_adapter_checkpoint and located by discover_adapters; each arm now has
+    several checkpoints, so the mapping is the natural shape. `b_calib=0` is the
+    undistilled base and needs no adapter.
+
+    Before the improvement run saves any, `adapters` is empty and only
+    `b_calib=0` is reachable: Run 1's adapters died with the Colab runtime, and
+    re-deriving them is training, which this module does not do.
     """
-    if method in ("plain_svd", "act_aware_uniform"):
-        ranks = uniform_ranks(shapes, ratio)
-        alloc_feasible = True
-    elif method == "act_aware_greedy":
-        target = rho_of(uniform_ranks(shapes, ratio), shapes)
-        alloc = greedy_ranks(svals, shapes, target * dense_params(shapes), floor=floor)
-        ranks, alloc_feasible = alloc.ranks, alloc.feasible
-    else:
-        raise ValueError(f"unknown method {method!r}")
+    ranks, alloc_feasible = _ranks_for(shapes, svals, method, ratio, floor)
 
     model, rho, stats = build_truncated(cfg, cache, shapes, ranks, method, DEV)
 
-    if adapter_path is not None:
+    if b_calib:
+        if not adapters or b_calib not in adapters:
+            raise RuntimeError(
+                f"no saved adapter for B_calib={b_calib} on this arm; "
+                f"available: {sorted(adapters or {})}")
         from peft import PeftModel
-        model = PeftModel.from_pretrained(model, adapter_path)
+        model = PeftModel.from_pretrained(model, adapters[b_calib])
         model = model.merge_and_unload()
 
     return model, rho, stats, alloc_feasible
@@ -287,11 +319,71 @@ def build_prompts(cfg: Cfg, spec: PromptSpec, tok) -> Tuple[List[torch.Tensor], 
     return prompts, PromptSpec(**{**asdict(spec), "offsets": tuple(map(tuple, offsets))})
 
 
+def _ranks_for(shapes, svals, method: str, ratio: float,
+               floor: Optional[float]) -> Tuple[Dict[str, int], bool]:
+    """The rank assignment for one arm. Same code path as run_model, so the
+    adapter manifests written during distillation compare equal to these."""
+    if method in ("plain_svd", "act_aware_uniform"):
+        return uniform_ranks(shapes, ratio), True
+    if method == "act_aware_greedy":
+        target = rho_of(uniform_ranks(shapes, ratio), shapes)
+        alloc = greedy_ranks(svals, shapes, target * dense_params(shapes), floor=floor)
+        return alloc.ranks, alloc.feasible
+    raise ValueError(f"unknown method {method!r}")
+
+
+def _oracle_one(rows: List[Dict], cfg: Cfg, cache: Cache, shapes, svals,
+                method: str, ratio: float, floor: Optional[float], b_calib: int,
+                adapters: Dict[int, str], ref, prompts, spec,
+                epsilons, gen) -> None:
+    """One (arm, B_calib) cell: rebuild, profile KL, measure the oracle curve."""
+    hollow, rho, _stats, feasible = rebuild_hollow(
+        cfg, cache, shapes, svals, method, ratio, floor,
+        adapters=adapters, b_calib=b_calib)
+    hollow.eval().to(DEV)
+
+    kl = kl_profile(ref, hollow, prompts, DEV, topk=cfg.topk)
+
+    for eps in epsilons:
+        null = _llr_samples(ref, hollow, prompts, DEV,
+                            N_NULL_CALIB // 100, False, eps, gen)
+        alt = _llr_samples(ref, hollow, prompts, DEV,
+                           N_TRIALS // 10, True, eps, gen)
+        power = oracle_power(null, alt, gen=gen)
+        n_emp = queries_to_detection(power)
+        n_pred = n_star_chernoff_stein(kl["kl_exact_per_token"])
+        rows.append({
+            "model": cfg.model_id, "method": method, "floor": floor,
+            "keep_ratio": ratio, "rho": rho, "B_calib": b_calib,
+            "adapter": adapters.get(b_calib),
+            "budget_feasible": feasible,
+            "epsilon": eps,
+            **kl,
+            "power_at_N": power,
+            "n_star_empirical": n_emp,
+            "n_star_predicted": n_pred,
+            "empirical_over_predicted":
+                (n_emp / n_pred) if (n_emp and math.isfinite(n_pred)) else None,
+            "alpha": ALPHA, "power_target": POWER_TARGET,
+            "resp_tokens": RESP_TOKENS,
+            "access_model": ACCESS_NOTE,
+            "is_bound": True,
+            "prompts": asdict(spec),
+        })
+    del hollow
+    sweep()
+
+
 def run(cfg: Cfg = CFG_1_5B, out: str = "results/auditor_oracle.json",
         epsilons: Tuple[float, ...] = (1.0, 0.1),
         methods: Tuple[str, ...] = ("act_aware_greedy", "act_aware_uniform"),
         floors: Optional[Tuple[float, ...]] = None) -> Dict:
-    """Measure the oracle curve for every B_calib=0 arm of `cfg`."""
+    """Measure the oracle curve for every arm of `cfg`, at B_calib=0 and at
+    every checkpoint the improvement run has saved an adapter for.
+
+    The quantity this is building toward is N*(rho, B_calib): how much
+    calibration the adversary needs before the auditor stops seeing it.
+    """
     gen = torch.Generator().manual_seed(SEED)
     tok = AutoTokenizer.from_pretrained(cfg.model_id)
     cache = Cache(cfg)
@@ -303,46 +395,26 @@ def run(cfg: Cfg = CFG_1_5B, out: str = "results/auditor_oracle.json",
     ref = AutoModelForCausalLM.from_pretrained(cfg.model_id, torch_dtype=torch.float32)
     ref.eval().to(DEV)
 
-    rows = []
+    root = adapter_root(cfg)
+    if root is None:
+        log("no Drive mounted: only B_calib=0 is reachable this session")
+
+    rows: List[Dict] = []
     floors = floors if floors is not None else getattr(cfg, "floors", (cfg.floor,))
     for method in methods:
         fl_grid = floors if method == "act_aware_greedy" else (None,)
         for floor in fl_grid:
             for ratio in cfg.ratios:
-                log(f"oracle: {method} floor={floor} keep={ratio}")
-                hollow, rho, stats, feasible = rebuild_hollow(
-                    cfg, cache, shapes, svals, method, ratio, floor)
-                hollow.eval().to(DEV)
-
-                kl = kl_profile(ref, hollow, prompts, DEV, topk=cfg.topk)
-
-                for eps in epsilons:
-                    null = _llr_samples(ref, hollow, prompts, DEV,
-                                        N_NULL_CALIB // 100, False, eps, gen)
-                    alt = _llr_samples(ref, hollow, prompts, DEV,
-                                       N_TRIALS // 10, True, eps, gen)
-                    power = oracle_power(null, alt, gen=gen)
-                    n_emp = queries_to_detection(power)
-                    n_pred = n_star_chernoff_stein(kl["kl_exact_per_token"])
-                    rows.append({
-                        "model": cfg.model_id, "method": method, "floor": floor,
-                        "keep_ratio": ratio, "rho": rho, "B_calib": 0,
-                        "budget_feasible": feasible,
-                        "epsilon": eps,
-                        **kl,
-                        "power_at_N": power,
-                        "n_star_empirical": n_emp,
-                        "n_star_predicted": n_pred,
-                        "empirical_over_predicted":
-                            (n_emp / n_pred) if (n_emp and math.isfinite(n_pred)) else None,
-                        "alpha": ALPHA, "power_target": POWER_TARGET,
-                        "resp_tokens": RESP_TOKENS,
-                        "access_model": ACCESS_NOTE,
-                        "is_bound": True,
-                        "prompts": asdict(spec),
-                    })
-                del hollow
-                sweep()
+                ranks, _feasible = _ranks_for(shapes, svals, method, ratio, floor)
+                adapters = (discover_adapters(root, cache.key, method, ratio,
+                                              floor, ranks) if root else {})
+                budgets = [0] + sorted(adapters)
+                log(f"oracle: {method} floor={floor} keep={ratio} "
+                    f"B_calib={budgets}")
+                for b in budgets:
+                    _oracle_one(rows, cfg, cache, shapes, svals, method, ratio,
+                                floor, b, adapters, ref, prompts, spec,
+                                epsilons, gen)
 
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     payload = {"_meta": {"alpha": ALPHA, "n_grid": list(N_GRID), "seed": SEED,
