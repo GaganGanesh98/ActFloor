@@ -233,6 +233,14 @@ class Cfg:
                                  # since Z = Vh L⁻¹ already encodes it)
     out_name: str = "exp1_gpu_results.json"
 
+    # --- adapter checkpointing ------------------------------------------------
+    # Off by default, so CFG_1_5B / CFG_7B / SMOKE are untouched. When on,
+    # lora_distil writes the LoRA adapter (NOT merged weights) plus a manifest
+    # at every B_calib checkpoint, to Drive rather than scratch -- the point is
+    # surviving a runtime death, which is what lost the Run 1 adapters.
+    save_adapters: bool = False
+    adapter_dir: Optional[str] = None   # None -> <drive>/adapters
+
     # --- protocol checks ------------------------------------------------------
     sanity_layers: Tuple[int, ...] = (0,)   # layers on which to run the L vs Lᵀ check
     sanity_paths: Tuple[str, ...] = ("self_attn.q_proj", "self_attn.o_proj")
@@ -1223,8 +1231,64 @@ def validate_topk_kl(cfg: Cfg, cache: Cache, shapes, svals, distil_ids,
     return {"rho": rho, "ratio": ratio, "batches": rows}
 
 
+def adapter_root(cfg: Cfg) -> Optional[str]:
+    """Where adapters go. Drive, never scratch: scratch dies with the runtime,
+    and an adapter that does not outlive the session is worth nothing."""
+    if cfg.adapter_dir:
+        return cfg.adapter_dir
+    d = mount_drive(cfg)
+    return os.path.join(d, "adapters") if d else None
+
+
+def save_adapter_checkpoint(pm, step: int, cfg: Cfg, cache: Cache, method: str,
+                            ratio: float, floor: Optional[float],
+                            ranks: Dict[str, int], rho: float) -> Optional[str]:
+    """Save the LoRA adapter at one B_calib checkpoint, with the manifest needed
+    to rebuild the model around it.
+
+    An adapter alone reconstructs nothing. It sits on top of a *truncated* base,
+    which is determined by the factor cache (`calib_key`) and the exact rank
+    assignment. Both are recorded here, because in three weeks nobody remembers
+    which arm an orphaned adapter came from.
+
+    `pm.save_pretrained` writes adapter tensors only -- ~40 MB against ~3 GB for
+    merged weights.
+    """
+    root = adapter_root(cfg)
+    if root is None:
+        log("  adapter checkpoint skipped: no Drive mounted")
+        return None
+    fl = "none" if floor is None else f"{floor}"
+    path = os.path.join(root, cache.key,
+                        f"{method}_keep{ratio}_floor{fl}", f"B{step}")
+    os.makedirs(path, exist_ok=True)
+    pm.save_pretrained(path)
+    manifest = {
+        "calib_key": cache.key,
+        "model_id": cfg.model_id,
+        "method": method,
+        "keep_ratio": ratio,
+        "floor": floor,
+        "B_calib": step,
+        "rho": rho,
+        "ranks": {k: int(v) for k, v in ranks.items()},
+        "lora": {"r": cfg.lora_r, "alpha": cfg.lora_alpha,
+                 "dropout": cfg.lora_dropout, "lr": cfg.lr},
+        "distil": {"ndistil": cfg.ndistil, "distil_seqlen": cfg.distil_seqlen,
+                   "topk": cfg.topk},
+        "saved": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "note": ("LoRA adapter only. Rebuild the truncated base from the factor "
+                 "cache under calib_key using this exact ranks dict, then apply "
+                 "this adapter. The adapter is meaningless on the dense model."),
+    }
+    with open(os.path.join(path, "manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=1)
+    log(f"    adapter checkpoint -> {path}")
+    return path
+
+
 def lora_distil(cfg: Cfg, student, teacher_obj, distil_ids, eval_ids, device,
-                eval_at: List[int]):
+                eval_at: List[int], ckpt: Optional[Dict] = None):
     """Distil `student` against the cached teacher. Returns {steps: ppl}, with
     perplexity measured at each checkpoint in `eval_at` (adapters active)."""
     from peft import LoraConfig, get_peft_model
@@ -1282,6 +1346,8 @@ def lora_distil(cfg: Cfg, student, teacher_obj, distil_ids, eval_ids, device,
             with torch.no_grad():
                 out[step] = perplexity(pm, eval_ids, device, streamed=False)
             log(f"    B_calib={step}: ppl {out[step]:.4f}")
+            if ckpt is not None:
+                save_adapter_checkpoint(pm, step, **ckpt)
             pm.train()
             sweep()
 
@@ -1490,8 +1556,11 @@ def run_model(cfg: Cfg, results: Dict, out_path: str, do_1b: bool = True):
                 log(f"distil {method} keep={ratio} rho={rho:.4f} "
                     f"for {max(eval_at)} steps")
                 try:
+                    ckpt = ({"cfg": cfg, "cache": cache, "method": method,
+                             "ratio": ratio, "floor": fl, "ranks": ranks,
+                             "rho": rho} if cfg.save_adapters else None)
                     ppls, pm = lora_distil(cfg, model, teacher, distil_ids,
-                                           eval_ids, DEV, eval_at)
+                                           eval_ids, DEV, eval_at, ckpt=ckpt)
                 except RuntimeError as e:
                     if "out of memory" not in str(e).lower():
                         raise
