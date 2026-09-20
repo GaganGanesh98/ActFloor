@@ -87,8 +87,9 @@ import subprocess, sys
 def _pip(*pkgs):
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", *pkgs], check=False)
 
-_pip("transformers>=4.44", "datasets", "accelerate", "peft", "safetensors")
-print("deps ok")
+if __name__ == "__main__":  # skipped on import (auditor.py); Jupyter/Colab set __name__ == "__main__"
+    _pip("transformers>=4.44", "datasets", "accelerate", "peft", "safetensors")
+    print("deps ok")
 
 # %%
 # --- imports, preflight ------------------------------------------------------
@@ -439,6 +440,9 @@ def synthetic_whitening_check(m=96, n=128, N=4096, r=32, seed=0, verbose=True):
     return {"act_aware_L": e_L, "act_aware_LT": e_Lt, "plain_svd": e_p}
 
 
+# Deliberately NOT under a __main__ guard: this is a cheap, self-contained
+# protocol check (L vs L-transpose whitening on synthetic data) and running it
+# on every import -- including from auditor.py -- is a feature, not a cost.
 _ = synthetic_whitening_check()
 
 
@@ -1631,10 +1635,11 @@ SMOKE = Cfg(
     out_name="smoke.json",
 )
 
-smoke_results: Dict = {}
-run_model(SMOKE, smoke_results,
-          os.path.join(SMOKE.scratch, SMOKE.out_name), do_1b=True)
-print_table(smoke_results)
+if __name__ == "__main__":
+    smoke_results: Dict = {}
+    run_model(SMOKE, smoke_results,
+              os.path.join(SMOKE.scratch, SMOKE.out_name), do_1b=True)
+    print_table(smoke_results)
 
 
 # %% [markdown]
@@ -1693,14 +1698,15 @@ CFG_1_5B = Cfg(
     drive_factors=False,
 )
 
-if mount_drive(CFG_1_5B):
-    os.makedirs(os.path.dirname(OUT), exist_ok=True)
-else:                                   # no Drive (not on Colab) -> local file
-    OUT = os.path.join(CFG_1_5B.scratch, CFG_1_5B.out_name)
-    os.makedirs(CFG_1_5B.scratch, exist_ok=True)
+if __name__ == "__main__":
+    if mount_drive(CFG_1_5B):
+        os.makedirs(os.path.dirname(OUT), exist_ok=True)
+    else:                                   # no Drive (not on Colab) -> local file
+        OUT = os.path.join(CFG_1_5B.scratch, CFG_1_5B.out_name)
+        os.makedirs(CFG_1_5B.scratch, exist_ok=True)
 
-run_model(CFG_1_5B, RESULTS, OUT)
-print_table(RESULTS)
+    run_model(CFG_1_5B, RESULTS, OUT)
+    print_table(RESULTS)
 
 # %% [markdown]
 # ## Run 2 — Qwen2.5-7B-Instruct
@@ -1735,24 +1741,26 @@ CFG_7B = Cfg(
     grad_checkpointing=True,
 )
 
-run_model(CFG_7B, RESULTS, OUT)
-print_table(RESULTS)
+if __name__ == "__main__":
+    run_model(CFG_7B, RESULTS, OUT)
+    print_table(RESULTS)
 
 # %% [markdown]
 # ## Final output
 
 # %%
 # The requested deliverable: one flat row per (model, method, B_calib, rho).
-RESULTS["table"] = [
-    {"model": r["model"], "method": r["method"], "B_calib": r["B_calib"],
-     "keep_ratio": r.get("keep_ratio"), "rho": r["rho"],
-     "ppl": r["ppl"], "base_ppl": r["base_ppl"], "d_ppl_pct": r["d_ppl_pct"],
-     "floor": r.get("floor"), "n_kept_dense": r.get("n_kept_dense")}
-    for model_id, entry in RESULTS.items()
-    if not model_id.startswith("_") and isinstance(entry, dict)
-    for r in entry.get("rows", [])
-]
-with open(OUT, "w") as f:
-    json.dump(RESULTS, f, indent=1)
-print(markdown_table(RESULTS))
-print(f"\n{len(RESULTS['table'])} rows written to {OUT}")
+if __name__ == "__main__":
+    RESULTS["table"] = [
+        {"model": r["model"], "method": r["method"], "B_calib": r["B_calib"],
+         "keep_ratio": r.get("keep_ratio"), "rho": r["rho"],
+         "ppl": r["ppl"], "base_ppl": r["base_ppl"], "d_ppl_pct": r["d_ppl_pct"],
+         "floor": r.get("floor"), "n_kept_dense": r.get("n_kept_dense")}
+        for model_id, entry in RESULTS.items()
+        if not model_id.startswith("_") and isinstance(entry, dict)
+        for r in entry.get("rows", [])
+    ]
+    with open(OUT, "w") as f:
+        json.dump(RESULTS, f, indent=1)
+    print(markdown_table(RESULTS))
+    print(f"\n{len(RESULTS['table'])} rows written to {OUT}")
