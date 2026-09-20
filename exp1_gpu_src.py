@@ -1815,6 +1815,115 @@ if __name__ == "__main__":
     print_table(RESULTS)
 
 # %% [markdown]
+# ## Run 3 — improvement session (floor 0.4, adapters saved)
+#
+# Two jobs in one session, both on the arm Run 1 never distilled. Exp 1b only
+# ever distils `cfg.floor`, which was 0.25, so floor 0.4 — **8.36× better in
+# Δ ppl at `keep = 0.9`** (+28.68% vs +239.67%, at essentially the same `ρ`) —
+# has never been combined with the distillation lever. Those are the two
+# strongest levers in the experiment and they have never been composed.
+#
+# `CFG_1_5B` is untouched: it produced `results/exp1_gpu_results.json` and stays
+# reproducible. These configs share every field that enters `calib_key()`, so
+# they reuse the same factor cache, and `drive_factors=True` finally puts that
+# cache somewhere a later `auditor.py` session can find it — `cache_plain=False`
+# drops it from 12.2 to 6.1 GiB, which is what makes it fit a free Drive.
+#
+# **Which arm gets the convergence run.** `keep = 0.5` (`ρ = 0.6245`), because
+# H5 as pre-registered can only be falsified at `ρ ≤ 0.7` and that is the only
+# floor-0.4 arm in the region. `keep = 0.9` would look far more dramatic — an
+# 11× improvement on +28.68% lands near +2.6% — but at `ρ = 0.8949` it cannot
+# satisfy the criterion whatever it reaches.
+#
+# That asymmetry is itself the finding: **the `ρ` threshold, not the quality
+# threshold, is doing all the work in H5.** No quality improvement at high `ρ`
+# can falsify it, so the only live falsification path is improving quality at
+# low `ρ` — which is exactly what the convergence run tests. Worth a paragraph
+# in the write-up.
+#
+# Note that with `methods=("act_aware_greedy",)` the end-to-end act-aware-vs-
+# plain-SVD protocol check records nothing (it needs both arms present). The
+# matrix-level `L` vs `Lᵀ` check and `synthetic_whitening_check()` still run, so
+# the whitening convention is still verified; the end-to-end assertion is not.
+
+# %%
+_IMPROVE_KW = dict(
+    model_id="Qwen/Qwen2.5-1.5B-Instruct",
+    seqlen=512, ncalib=128, neval=64,      # identical to CFG_1_5B => same
+    ndistil=512, distil_seqlen=256,        # calib_key => factors computed once
+    floor=0.4, floors=(0.4,),
+    methods=("act_aware_greedy",),         # uniform and plain SVD already measured
+    distil_methods=("act_aware_greedy",),
+    cache_plain=False,                     # 12.2 -> 6.1 GiB of factors
+    drive_factors=True,                    # which then fits a free Drive
+    save_adapters=True,                    # the point of the session
+)
+
+# Job A — the missing floor-0.4 distillation cells.
+CFG_IMPROVE = Cfg(
+    ratios=(0.9, 0.75),
+    distil_ratios=(0.9, 0.75),
+    b_calib=(0, 100, 300, 500),
+    out_name="exp1_improve_results.json",
+    **_IMPROVE_KW,
+)
+
+# Job B — the convergence question, on the one arm where H5 can be falsified.
+# keep=0.5 is deliberately absent from Job A: this grid already contains 500, so
+# running it in both would repeat 500 steps for nothing.
+CFG_CONVERGE = Cfg(
+    ratios=(0.5,),
+    distil_ratios=(0.5,),
+    b_calib=(0, 250, 500, 1000, 2000, 3000),
+    out_name="exp1_converge_results.json",
+    **_IMPROVE_KW,
+)
+
+# %%
+if __name__ == "__main__":
+    def _clear_stale_manifest(c: Cfg) -> None:
+        """Run 1 wrote `manifest` and `svals` to Drive but NOT the factors
+        (`drive_factors=False`, so `fac/*` is `big=True` and was gated out).
+        These configs share Run 1's calib_key, so `run_calibration` would find
+        that manifest, log "factors already cached -- skipping calibration
+        pass", and then die in `build_truncated` on the first missing
+        `fac/*.pt`. Drop the stale manifest so the pass actually re-runs; this
+        time `drive_factors=True` mirrors the factors with it.
+        """
+        cache = Cache(c)
+        if not cache.has("manifest"):
+            return
+        probe = next(iter(cache.get("manifest")["shapes"]))
+        if cache.has(f"fac/{probe}"):
+            log("factor cache is complete -- calibration will be skipped")
+            return
+        for base in (cache.scratch, cache.drive):
+            if not base:
+                continue
+            p = os.path.join(base, Cache._fn("manifest"))
+            if os.path.exists(p):
+                os.remove(p)
+                log(f"removed stale manifest (factors absent): {p}")
+
+    def _out_for(c: Cfg) -> str:
+        d = mount_drive(c)
+        base = d if d else c.scratch
+        os.makedirs(base, exist_ok=True)
+        return os.path.join(base, c.out_name)
+
+    # Separate results dicts: `run_model` keys its entry by model_id, and both
+    # configs are the same model, so one shared dict would silently overwrite.
+    _clear_stale_manifest(CFG_IMPROVE)
+
+    IMPROVE: Dict = {}
+    run_model(CFG_IMPROVE, IMPROVE, _out_for(CFG_IMPROVE))
+    print_table(IMPROVE)
+
+    CONVERGE: Dict = {}
+    run_model(CFG_CONVERGE, CONVERGE, _out_for(CFG_CONVERGE))
+    print_table(CONVERGE)
+
+# %% [markdown]
 # ## Final output
 
 # %%
