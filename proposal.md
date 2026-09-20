@@ -331,7 +331,7 @@ Implement and run, all black-box, all with reference access to the honest model:
 | Auditor | Source | Signal | Assumption |
 |---|---|---|---|
 | Model Equality Testing | arXiv:2410.20247 (ICLR'25) | MMD two-sample on output distributions | sampled text only |
-| Rank-based uniformity | arXiv:2506.06975 (ICLR'26) | rank statistics of reference tokens | top-`k` logprobs |
+| Rank-based uniformity | arXiv:2506.06975 (ICLR'26) | rank statistics of reference tokens | sampled text only (reference logprobs computed locally) — amended, see Appendix B |
 | IRIS | arXiv:2607.20860 | RNG-response fingerprint, self-calibrating budget | text only |
 | KBF | arXiv:2605.29524 | recall pattern near knowledge boundary | text only |
 
@@ -516,3 +516,57 @@ read directly. Do not cite it as read.
 **Note on sourcing.** Several search results surfaced via pith.science, a paper-mirror
 site. All citations above were verified against arxiv.org directly. Cite arXiv, never the
 mirror.
+
+
+---
+
+## Appendix B — Amendment log
+
+This proposal is pre-registered at commit `66cc0d8`, with the SHA-256 of the file as it
+stood there recorded in `PREREGISTRATION.md`. Amending it necessarily breaks that hash, so
+every change is logged here and the hash chain is recorded in `PREREGISTRATION.md`. A
+visible correction with a hash chain is rigour; a quietly changed file with a stale hash is
+not.
+
+Pre-registration protects the claims that could be biased in my own favour — H1–H5, the
+viability criterion, and §7's definition of auditor power. It does not oblige the document
+to preserve a factual error about what someone else's paper does.
+
+### A1 — 20 September 2026 — §6.2, access assumption for arXiv:2506.06975
+
+**Changed.** The Assumption column for the rank-based uniformity auditor, from
+"top-`k` logprobs" to "sampled text only (reference logprobs computed locally)".
+
+**Why.** The paper's abstract states that users "lack access to model weights and, in most
+cases, even output logits", and the RUT procedure does not require top-`k` logprobs from
+the target. Its statistic ranks a scalar score of the target's *completion* among `m`
+reference samples — `r_i = 1/m (Σ_j 1{s_i > s_ij} + U_i Σ_j 1{s_i = s_ij})` — and tests
+those ranks for uniformity on [0,1] with Cramér–von Mises. The score is a log-rank under
+the **reference** model's probabilities, which the auditor computes locally because it
+holds the reference weights. Nothing but text is required from the target.
+
+**Consequence.** All four auditors in §6.2 are text-only. W2 as pre-registered contains no
+logprob auditor, which is what motivates A2.
+
+**Not changed.** H1–H5, the viability criterion, §7's power definition, the Signal column
+of the row, and every other auditor in the table.
+
+### A2 — 20 September 2026 — W2 scope: the logprob oracle added ahead of the auditors
+
+**Changed.** `auditor.py` implements a logprob *oracle* — a Neyman–Pearson likelihood-ratio
+test with exact knowledge of both models' next-token distributions — and it runs before the
+four pre-registered auditors of §6.2.
+
+**Why.** It is not an auditor and is not claimed as one: no API exposes what it assumes, so
+it is a lower bound on `N*` and an upper bound on detectability, and every real auditor sits
+at or below its curve. Building it first calibrates the axis. If the oracle needs thousands
+of queries then no text-only auditor can do better and W2's answer is already visible; if it
+needs ten, the interesting quantity becomes how much MET and RUT give away relative to the
+bound.
+
+**Recorded before results exist.** This entry is written at the point the oracle was scoped
+and committed, not after its numbers were seen.
+
+**Not changed.** The §6.2 auditor list, `α = 0.01`, the power definition, or the
+requirement that budgets be fixed in advance. The oracle obeys all of them; in particular
+it does not walk `N` upward, which §7 forbids.

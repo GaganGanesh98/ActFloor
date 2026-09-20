@@ -21,6 +21,32 @@ The hypotheses below are reproduced **verbatim** from `proposal.md`, section 5
 SHA-256 above is the hash of the whole file; it can be reproduced with
 `git show 66cc0d8:proposal.md | shasum -a 256`.
 
+## Amendment chain for proposal.md
+
+The hypotheses above are frozen. `proposal.md` as a whole is not: it may be corrected where
+it states something factually wrong about work by other people. Each such change is logged
+in `proposal.md` Appendix B and its effect on the file hash is recorded here, so that a
+reader can verify any version and see exactly what moved between them.
+
+| Date | `proposal.md` SHA-256 | Amendments applied |
+|---|---|---|
+| 2026-09-19 (commit `66cc0d8`) | `aee813703cf67c64a9a701d76d9745a4df0535b72a31a614f01dc5a3f9be07df` | — (pre-registration baseline) |
+| 2026-09-20 | `a74137b57e848c9f8af08560969d7ab41fe8366a3a5904443c4ef8a81761bb6c` | A1, A2 |
+
+* **A1** — §6.2: the access assumption for arXiv:2506.06975 corrected from "top-`k`
+  logprobs" to "sampled text only (reference logprobs computed locally)". The paper's
+  rank-based uniformity test needs only completions from the target. A factual correction
+  about someone else's method, not a change to any claim of mine.
+* **A2** — W2 scope: a logprob **oracle** (`auditor.py`) added ahead of the four
+  pre-registered auditors, as an explicit bound rather than an auditor. Logged at the point
+  it was scoped, before any of its results existed.
+
+**Neither amendment touches H1–H5, the viability criterion, or §7's definition of auditor
+power at budget `N` (`α = 0.01`, budgets fixed in advance).** Those remain exactly as
+verified against `66cc0d8`, and the verbatim text below is unchanged. To check the baseline:
+
+    git show 66cc0d8:proposal.md | shasum -a 256
+
 ## Experimental status at commit 66cc0d8
 
 Exp 0 (spectral/structural scan), Exp 1a (uniform activation-aware truncation)
