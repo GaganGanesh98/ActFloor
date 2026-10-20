@@ -1880,48 +1880,90 @@ CFG_CONVERGE = Cfg(
 )
 
 # %%
-if __name__ == "__main__":
-    def _clear_stale_manifest(c: Cfg) -> None:
-        """Run 1 wrote `manifest` and `svals` to Drive but NOT the factors
-        (`drive_factors=False`, so `fac/*` is `big=True` and was gated out).
-        These configs share Run 1's calib_key, so `run_calibration` would find
-        that manifest, log "factors already cached -- skipping calibration
-        pass", and then die in `build_truncated` on the first missing
-        `fac/*.pt`. Drop the stale manifest so the pass actually re-runs; this
-        time `drive_factors=True` mirrors the factors with it.
-        """
-        cache = Cache(c)
-        if not cache.has("manifest"):
-            return
-        probe = next(iter(cache.get("manifest")["shapes"]))
-        if cache.has(f"fac/{probe}"):
-            log("factor cache is complete -- calibration will be skipped")
-            return
-        for base in (cache.scratch, cache.drive):
-            if not base:
-                continue
-            p = os.path.join(base, Cache._fn("manifest"))
-            if os.path.exists(p):
-                os.remove(p)
-                log(f"removed stale manifest (factors absent): {p}")
+def clear_stale_manifest(c: Cfg) -> None:
+    """Run 1 wrote `manifest` and `svals` to Drive but NOT the factors
+    (`drive_factors=False`, so `fac/*` is `big=True` and was gated out).
+    These configs share Run 1's calib_key, so `run_calibration` would find
+    that manifest, log "factors already cached -- skipping calibration
+    pass", and then die in `build_truncated` on the first missing
+    `fac/*.pt`. Drop the stale manifest so the pass actually re-runs; this
+    time `drive_factors=True` mirrors the factors with it.
+    """
+    cache = Cache(c)
+    if not cache.has("manifest"):
+        return
+    probe = next(iter(cache.get("manifest")["shapes"]))
+    if cache.has(f"fac/{probe}"):
+        log("factor cache is complete -- calibration will be skipped")
+        return
+    for base in (cache.scratch, cache.drive):
+        if not base:
+            continue
+        p = os.path.join(base, Cache._fn("manifest"))
+        if os.path.exists(p):
+            os.remove(p)
+            log(f"removed stale manifest (factors absent): {p}")
 
-    def _out_for(c: Cfg) -> str:
-        d = mount_drive(c)
-        base = d if d else c.scratch
-        os.makedirs(base, exist_ok=True)
-        return os.path.join(base, c.out_name)
+def out_for(c: Cfg) -> str:
+    d = mount_drive(c)
+    base = d if d else c.scratch
+    os.makedirs(base, exist_ok=True)
+    return os.path.join(base, c.out_name)
 
+def run_improvement() -> Tuple[Dict, Dict]:
+    """Run 3, both jobs. Importable, so a hosted runtime can do
+    `import exp1_gpu_src as E; E.run_improvement()` without executing
+    every other cell in this file."""
     # Separate results dicts: `run_model` keys its entry by model_id, and both
     # configs are the same model, so one shared dict would silently overwrite.
-    _clear_stale_manifest(CFG_IMPROVE)
+    clear_stale_manifest(CFG_IMPROVE)
 
     IMPROVE: Dict = {}
-    run_model(CFG_IMPROVE, IMPROVE, _out_for(CFG_IMPROVE))
+    run_model(CFG_IMPROVE, IMPROVE, out_for(CFG_IMPROVE))
     print_table(IMPROVE)
 
     CONVERGE: Dict = {}
-    run_model(CFG_CONVERGE, CONVERGE, _out_for(CFG_CONVERGE))
+    run_model(CFG_CONVERGE, CONVERGE, out_for(CFG_CONVERGE))
     print_table(CONVERGE)
+    return IMPROVE, CONVERGE
+
+
+if __name__ == "__main__":
+    run_improvement()
+
+# %% [markdown]
+# ## Run 4 — Qwen2.5-0.5B under `CFG_1_5B` exactly (the scale confound)
+#
+# `findings-exp1-scale.md` §Limitations: the only 0.5B comparator came from
+# `exp1a_prime.py` (tinyshakespeare, `seqlen = 256`, `neval = 12`, baseline
+# 42.87), so no claim about compressibility and scale was sayable. This config is
+# `CFG_1_5B` with the model swapped and nothing else: same corpus, `seqlen`,
+# `ncalib`, `neval`, `ndistil`, ratios, floors, `B_calib` grid and distilled
+# ratios. Model size is the only difference.
+#
+# Three fields differ, and none enters any number: `out_name`, so it cannot
+# overwrite Run 1's JSON, and `save_adapters=True` + `adapter_dir`, so the oracle in
+# `auditor.py` can reach the distilled checkpoints. Off Colab the adapters go
+# to local scratch (gitignored) rather than Drive.
+#
+# Small enough to run on a laptop CPU: ~1.7 GiB of factors, both models
+# resident in fp32.
+
+# %%
+from dataclasses import replace as _replace
+
+CFG_0_5B_MATCHED = _replace(
+    CFG_1_5B,
+    model_id="Qwen/Qwen2.5-0.5B-Instruct",
+    out_name="exp1_0.5B_matched_results.json",
+    save_adapters=True,
+    adapter_dir=None if _ON_COLAB else os.path.join(DEFAULT_SCRATCH, "adapters"),
+)
+
+if __name__ == "__main__":
+    MATCHED: Dict = {}
+    run_model(CFG_0_5B_MATCHED, MATCHED, out_for(CFG_0_5B_MATCHED))
+    print_table(MATCHED)
 
 # %% [markdown]
 # ## Final output

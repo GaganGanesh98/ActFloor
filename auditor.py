@@ -72,8 +72,14 @@ from exp1_gpu_src import (  # noqa: E402
 ALPHA = 0.01                      # proposal.md section 7
 POWER_TARGET = 0.8                # secondary metric: queries-to-detection
 N_GRID = (1, 2, 3, 5, 10, 30, 100, 300, 1000)
-N_TRIALS = 2000                   # draws per budget for the power estimate
-N_NULL_CALIB = 20000              # null draws used to set the threshold
+N_TRIALS = 2000                   # resampled trials per budget for the power estimate
+# Responses actually sampled per (arm, epsilon). Each is a full 64-token
+# generation from a model, so these are the expensive numbers; the per-budget
+# null and alternative sums are then bootstrapped from them (`oracle_power`).
+# Previously written as N_NULL_CALIB // 100 and N_TRIALS // 10 -- the same
+# values, 200 each, under names that read as 20 000 and 2 000.
+N_NULL_DRAWS = 200
+N_ALT_DRAWS = 200
 RESP_TOKENS = 64                  # tokens per simulated API response
 SEED = 20260920
 
@@ -84,7 +90,7 @@ class PromptSpec:
     MUST run on the same prompts or the comparison is meaningless, so the split,
     the offsets and the seed are recorded in every output row."""
     split: str = "test"
-    dataset: str = "wikitext"
+    dataset: str = "Salesforce/wikitext"   # recorded label; prompts come from make_splits(cfg)
     dataset_config: str = "wikitext-2-raw-v1"
     n_prompts: int = 256
     prompt_tokens: int = 32
@@ -209,6 +215,40 @@ def kl_profile(ref, hollow, prompts: List[torch.Tensor], device,
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
+def _sample_exact(model, prompt: torch.Tensor, n_tokens: int, device,
+                  gen) -> torch.Tensor:
+    """Ancestral sampling from softmax(logits) at temperature 1, nothing else.
+
+    Not `model.generate`: that merges the checkpoint's generation_config, and
+    Qwen2.5-Instruct ships top_k=20 and repetition_penalty=1.05 there, which
+    survive an explicit top_p=1.0/temperature=1.0. Responses would then come
+    from a truncated, history-dependent distribution while `_llr_samples`
+    scores them under the plain softmax -- the statistic would no longer be
+    the likelihood ratio of the distributions being sampled, and the "oracle"
+    would not be one. `generate` also draws from the global RNG; this uses
+    `gen`, so draws are reproducible from SEED.
+
+    Stops after an EOS token (kept: the auditor sees the response end), as an
+    API would. Returns the response tokens only, shape [1, <= n_tokens].
+    """
+    eos = model.generation_config.eos_token_id
+    eos = set([eos] if isinstance(eos, int) else (eos or []))
+    x = prompt.unsqueeze(0).to(device)
+    out = model(x, use_cache=True)
+    past, toks = out.past_key_values, []
+    for _ in range(n_tokens):
+        probs = F.softmax(out.logits[:, -1].float(), dim=-1).cpu()
+        t = int(torch.multinomial(probs[0], 1, generator=gen))
+        toks.append(t)
+        if t in eos:
+            break
+        out = model(torch.tensor([[t]], device=device),
+                    past_key_values=past, use_cache=True)
+        past = out.past_key_values
+    return torch.tensor([toks], dtype=torch.long)
+
+
+@torch.no_grad()
 def _llr_samples(ref, hollow, prompts, device, n_draws: int,
                  from_hollow: bool, epsilon: float, gen) -> torch.Tensor:
     """Per-response log-likelihood ratios log p_ref(y) - log p_hollow(y).
@@ -225,10 +265,8 @@ def _llr_samples(ref, hollow, prompts, device, n_draws: int,
         serve_hollow = from_hollow and (epsilon >= 1.0 or
                                         float(torch.rand(1, generator=gen)) < epsilon)
         src = hollow if serve_hollow else ref
-        y = src.generate(prompt.unsqueeze(0).to(device),
-                         max_new_tokens=RESP_TOKENS, do_sample=True,
-                         top_p=1.0, temperature=1.0, pad_token_id=0)
-        resp = y[:, prompt.shape[0]:]
+        resp = _sample_exact(src, prompt, RESP_TOKENS, device, gen).to(device)
+        y = torch.cat([prompt.unsqueeze(0).to(device), resp], dim=1)
         s = 0.0
         for m, sign in ((ref, 1.0), (hollow, -1.0)):
             lp = F.log_softmax(m(y).logits.float()[:, :-1], dim=-1)
@@ -346,9 +384,9 @@ def _oracle_one(rows: List[Dict], cfg: Cfg, cache: Cache, shapes, svals,
 
     for eps in epsilons:
         null = _llr_samples(ref, hollow, prompts, DEV,
-                            N_NULL_CALIB // 100, False, eps, gen)
+                            N_NULL_DRAWS, False, eps, gen)
         alt = _llr_samples(ref, hollow, prompts, DEV,
-                           N_TRIALS // 10, True, eps, gen)
+                           N_ALT_DRAWS, True, eps, gen)
         power = oracle_power(null, alt, gen=gen)
         n_emp = queries_to_detection(power)
         n_pred = n_star_chernoff_stein(kl["kl_exact_per_token"])
@@ -366,6 +404,7 @@ def _oracle_one(rows: List[Dict], cfg: Cfg, cache: Cache, shapes, svals,
                 (n_emp / n_pred) if (n_emp and math.isfinite(n_pred)) else None,
             "alpha": ALPHA, "power_target": POWER_TARGET,
             "resp_tokens": RESP_TOKENS,
+            "n_null_draws": N_NULL_DRAWS, "n_alt_draws": N_ALT_DRAWS,
             "access_model": ACCESS_NOTE,
             "is_bound": True,
             "prompts": asdict(spec),
