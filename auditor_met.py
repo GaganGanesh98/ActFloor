@@ -57,8 +57,8 @@ from exp1_gpu_src import (Cfg, Cache, DEV, log, sweep, make_splits,
                           AutoModelForCausalLM, AutoTokenizer)
 
 M_PROMPTS = 25          # paper, Wikipedia task
-N_REF_POOL = 600        # reference completions, shared by every arm
-N_TGT_POOL = 300        # hollow completions per arm
+N_REF_POOL = 1000       # reference completions, shared by every arm
+N_TGT_POOL = 600        # hollow completions per arm (caps put N=300 in reach)
 N_SIM = 1000            # null simulations and alternative trials (paper: 1000)
 PAD = -1                # right-padding token; never a real token id
 
