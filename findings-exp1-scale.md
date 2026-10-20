@@ -10,6 +10,11 @@ Calibration `wikitext-2-raw-v1` train slice A (`ncalib = 128`, `seqlen = 512`); 
 Baseline perplexity **12.3471**. 196 factorable matrices, 1.31 B dense parameters.
 Floors swept: {0.25, 0.4}. `B_calib` ∈ {0, 100, 300, 500}.
 
+> **Update 20 Oct 2026.** The scale confound in §Limitations has been removed by Run 4
+> (`findings-exp1-0.5B-matched.md`). Under matched settings the direction of Result 1
+> does not hold in `rho ≤ 0.7`: the best distilled point there is +189% at 0.5B against
+> +258% at 1.5B. The text below is left as written on 20 Sep.
+
 ---
 
 ## Result 1 — H5 survives, and the margin has collapsed

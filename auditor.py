@@ -248,6 +248,53 @@ def _sample_exact(model, prompt: torch.Tensor, n_tokens: int, device,
     return torch.tensor([toks], dtype=torch.long)
 
 
+DRAW_BATCH = 16                   # responses sampled/scored per forward pass
+
+
+@torch.no_grad()
+def _sample_exact_batch(model, prompts: torch.Tensor, n_tokens: int, device,
+                        gen) -> torch.Tensor:
+    """Batched `_sample_exact`: B prompts of equal length (PromptSpec pins
+    prompt_tokens, so no padding or attention mask is needed). Same
+    distribution -- plain softmax at temperature 1, RNG from `gen` -- and the
+    same stopping rule: a row stops after it samples EOS (EOS kept).
+
+    Returns [B, n_tokens] with -1 after each row's end. Rows that have ended
+    keep being fed a token so the batch stays rectangular; their outputs are
+    discarded and, the model being causal, cannot touch earlier positions.
+    """
+    eos = model.generation_config.eos_token_id
+    eos = torch.tensor([eos] if isinstance(eos, int) else list(eos or []))
+    x = prompts.to(device)
+    B = x.shape[0]
+    out = model(x, use_cache=True)
+    past = out.past_key_values
+    toks = torch.full((B, n_tokens), -1, dtype=torch.long)
+    alive = torch.ones(B, dtype=torch.bool)
+    for t in range(n_tokens):
+        probs = F.softmax(out.logits[:, -1].float(), dim=-1).cpu()
+        nxt = torch.multinomial(probs, 1, generator=gen).squeeze(1)
+        toks[alive, t] = nxt[alive]
+        alive = alive & ~torch.isin(nxt, eos)
+        if not alive.any():
+            break
+        out = model(nxt[:, None].to(device), past_key_values=past, use_cache=True)
+        past = out.past_key_values
+    return toks
+
+
+@torch.no_grad()
+def _response_logprob(model, prompts: torch.Tensor, toks: torch.Tensor,
+                      device) -> torch.Tensor:
+    """Sum of log p(response token) under `model`, per row, over valid
+    (non -1) response positions only."""
+    T = prompts.shape[1]
+    y = torch.cat([prompts, toks.clamp_min(0)], dim=1).to(device)
+    lp = F.log_softmax(model(y).logits.float()[:, T - 1:-1], dim=-1).cpu()
+    tok_lp = lp.gather(-1, toks.clamp_min(0).unsqueeze(-1)).squeeze(-1)
+    return (tok_lp * (toks >= 0)).sum(1)
+
+
 @torch.no_grad()
 def _llr_samples(ref, hollow, prompts, device, n_draws: int,
                  from_hollow: bool, epsilon: float, gen) -> torch.Tensor:
@@ -258,24 +305,30 @@ def _llr_samples(ref, hollow, prompts, device, n_draws: int,
     the provider serves hollow on an epsilon fraction of requests. Note this is
     the plug-in LLR against a mixture, not the optimal mixture test, so power
     under epsilon < 1 is itself a lower bound.
+
+    Sampled DRAW_BATCH at a time; each draw is still an independent prompt
+    and an independent exact sample, so batching changes cost, not the test.
     """
     out = torch.empty(n_draws)
-    for i in range(n_draws):
-        prompt = prompts[int(torch.randint(len(prompts), (1,), generator=gen))]
-        serve_hollow = from_hollow and (epsilon >= 1.0 or
-                                        float(torch.rand(1, generator=gen)) < epsilon)
-        src = hollow if serve_hollow else ref
-        resp = _sample_exact(src, prompt, RESP_TOKENS, device, gen).to(device)
-        y = torch.cat([prompt.unsqueeze(0).to(device), resp], dim=1)
-        s = 0.0
-        for m, sign in ((ref, 1.0), (hollow, -1.0)):
-            lp = F.log_softmax(m(y).logits.float()[:, :-1], dim=-1)
-            tgt = y[:, 1:]
-            tok_lp = lp.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
-            s += sign * float(tok_lp[:, -resp.shape[1]:].sum())
-        out[i] = s
-        if i % 50 == 0:
-            sweep()
+    P = torch.stack(prompts)
+    for a in range(0, n_draws, DRAW_BATCH):
+        b = min(DRAW_BATCH, n_draws - a)
+        pidx = torch.randint(len(prompts), (b,), generator=gen)
+        if from_hollow:
+            use_h = (torch.ones(b, dtype=torch.bool) if epsilon >= 1.0
+                     else torch.rand(b, generator=gen) < epsilon)
+        else:
+            use_h = torch.zeros(b, dtype=torch.bool)
+        toks = torch.full((b, RESP_TOKENS), -1, dtype=torch.long)
+        for src, sel in ((hollow, use_h), (ref, ~use_h)):
+            if sel.any():
+                toks[sel] = _sample_exact_batch(src, P[pidx[sel]], RESP_TOKENS,
+                                                device, gen)
+        pr = P[pidx]
+        out[a:a + b] = (_response_logprob(ref, pr, toks, device)
+                        - _response_logprob(hollow, pr, toks, device))
+        log(f"    llr draw {a + b}/{n_draws} ({'alt' if from_hollow else 'null'})")
+        sweep()
     return out
 
 
@@ -407,7 +460,7 @@ def _oracle_one(rows: List[Dict], cfg: Cfg, cache: Cache, shapes, svals,
             "n_null_draws": N_NULL_DRAWS, "n_alt_draws": N_ALT_DRAWS,
             "access_model": ACCESS_NOTE,
             "is_bound": True,
-            "prompts": asdict(spec),
+            "prompts": asdict(spec), "m_prompts": len(prompts),
         })
     del hollow
     sweep()
@@ -416,7 +469,8 @@ def _oracle_one(rows: List[Dict], cfg: Cfg, cache: Cache, shapes, svals,
 def run(cfg: Cfg = CFG_1_5B, out: str = "results/auditor_oracle.json",
         epsilons: Tuple[float, ...] = (1.0, 0.1),
         methods: Tuple[str, ...] = ("act_aware_greedy", "act_aware_uniform"),
-        floors: Optional[Tuple[float, ...]] = None) -> Dict:
+        floors: Optional[Tuple[float, ...]] = None,
+        m_prompts: Optional[int] = None) -> Dict:
     """Measure the oracle curve for every arm of `cfg`, at B_calib=0 and at
     every checkpoint the improvement run has saved an adapter for.
 
@@ -431,7 +485,11 @@ def run(cfg: Cfg = CFG_1_5B, out: str = "results/auditor_oracle.json",
     shapes, svals = man["shapes"], cache.get("svals")
 
     prompts, spec = build_prompts(cfg, PromptSpec(), tok)
-    ref = AutoModelForCausalLM.from_pretrained(cfg.model_id, torch_dtype=torch.float32)
+    # A bound on a text-only auditor only holds on the auditor's own query
+    # distribution: pass m_prompts=auditor_met.M_PROMPTS to compare with MET.
+    if m_prompts is not None:
+        prompts = prompts[:m_prompts]
+    ref = AutoModelForCausalLM.from_pretrained(cfg.model_id, dtype=torch.float32)
     ref.eval().to(DEV)
 
     root = adapter_root(cfg)
@@ -454,14 +512,20 @@ def run(cfg: Cfg = CFG_1_5B, out: str = "results/auditor_oracle.json",
                     _oracle_one(rows, cfg, cache, shapes, svals, method, ratio,
                                 floor, b, adapters, ref, prompts, spec,
                                 epsilons, gen)
+                    _flush(out, rows)   # a cell is an hour on CPU; keep it
 
+    payload = _flush(out, rows)
+    log(f"{len(rows)} oracle rows -> {out}")
+    return payload
+
+
+def _flush(out: str, rows: List[Dict]) -> Dict:
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     payload = {"_meta": {"alpha": ALPHA, "n_grid": list(N_GRID), "seed": SEED,
                          "access_model": ACCESS_NOTE, "is_bound": True},
                "rows": rows}
     with open(out, "w") as f:
         json.dump(payload, f, indent=1)
-    log(f"{len(rows)} oracle rows -> {out}")
     return payload
 
 
