@@ -1,4 +1,4 @@
-# W2 at 0.5B — the oracle bound and Model Equality Testing
+# W2 at 0.5B — the oracle bound, MET and RUT
 
 Run 20 October 2026, laptop CPU (Apple M1, float32). First measurements of the primary
 metric of proposal §7: auditor power at `α = 0.01` against `ρ` and query budget `N`.
@@ -95,12 +95,41 @@ What that does and does not mean:
   primary metric now depends on whether a text-only auditor closes most of that 300×
   gap. Rank-based uniformity (arXiv:2506.06975) scores sampled tokens under locally
   computed reference log-probabilities, which is structurally much closer to the oracle
-  than an MMD on token identities. It is the next auditor to build, and the one most
-  likely to rescue the "detected in a handful of queries" claim.
+  than an MMD on token identities. **Result 4: at `keep = 0.75` it does** — `N* ≤ 5`
+  on every distilled cell.
 * **The perplexity proxy is badly calibrated against MET.** +81% Δ ppl corresponds to
   MET power 0.32 at N = 300; +189% to 0.96. The pre-registered `Δ ppl < 5%` threshold
   assumed small perplexity damage is the hard case for auditors. Against MET, much
   larger damage is already hard.
+
+## Result 4 — RUT closes most of the gap (keep 0.75; keep 0.5 pending)
+
+`results/auditor_rut_0.5B.json`, `auditor_rut.py` (arXiv:2506.06975): mean log-rank of the
+response under the reference, randomised rank against 100 reference responses per prompt,
+Cramér–von Mises test. Same prompts, responses, `α` and budgets as above. The laptop run
+was stopped after its four `keep = 0.75` cells; the `keep = 0.5` cells go to Colab
+(`RUNBOOK_COLAB.md`), on the same uploaded factors and adapters.
+
+Realised level, held-out reference responses through the identical test: 0.005–0.016 at
+every `N` (0.009 at `N = 300`). The test holds its size.
+
+| keep | ρ | B_calib | Δ ppl | N = 1 | N = 2 | N = 3 | N = 5 | N = 10 | N* (power 0.8) |
+|---|---|---|---|---|---|---|---|---|---|
+| 0.75 | 0.8023 | 0 | +262.72% | 0.879 | 0.943 | 0.959 | 0.998 | 1.000 | **1** |
+| 0.75 | 0.8023 | 100 | +119.29% | 0.491 | 0.820 | 0.930 | 0.990 | 1.000 | **2** |
+| 0.75 | 0.8023 | 300 | +92.54% | 0.354 | 0.625 | 0.773 | 0.968 | 1.000 | **5** |
+| 0.75 | 0.8023 | 500 | +80.94% | 0.278 | 0.602 | 0.739 | 0.934 | 1.000 | **5** |
+
+On the cell where MET reaches only 0.32 at 300 queries (`B_calib = 500`), **RUT reaches
+0.93 at 5 queries and 1.0 at 10.** The oracle-to-auditor gap is 1–5×, not ≥ 300×. So for
+these models the gap in Result 2 was MET's weakness, not a limit on text-only auditing.
+For RUT, "detected in a handful of queries" holds at `ρ = 0.80`.
+
+Distillation still costs the auditor something: RUT's `N*` goes 1 → 2 → 5 → 5 over
+`B_calib` 0 → 500. The mean hollow log-rank falls 4.69 → 2.83 against 1.66 for the
+reference. That curve is moving toward the reference and has not flattened, which makes
+Run 3's 3 000-step convergence arm the experiment that tests whether RUT's margin
+survives a stronger adversary.
 
 ---
 
@@ -144,10 +173,11 @@ produced, and both would have made the oracle numbers wrong:
 
 ## Next
 
-1. **Rank-based uniformity auditor** (arXiv:2506.06975): the next pre-registered W2
-   auditor, and the one that decides whether the ≥ 300× gap on distilled models is MET's weakness or every
-   text-only auditor's.
-2. **Run 3 on Colab**, then the oracle and MET at 1.5B on its saved adapters, so W2 has
+1. **Finish RUT at `keep = 0.5`** on Colab (`RUNBOOK_COLAB.md`, second runbook): the
+   `ρ ≤ 0.7` cells, the ones that bear on H5 as pre-registered.
+2. **IRIS and KBF** (arXiv:2607.20860, 2605.29524): the last two pre-registered auditors.
+   Neither is implemented; both need their papers read first.
+3. **Run 3 on Colab**, then the oracle and MET at 1.5B on its saved adapters, so W2 has
    a second scale. `RUNBOOK_COLAB.md`.
-3. `ε < 1` (fractional dilution) for both auditors at 0.5B; it is already supported in
+4. `ε < 1` (fractional dilution) for both auditors at 0.5B; it is already supported in
    the code and only costs CPU time.

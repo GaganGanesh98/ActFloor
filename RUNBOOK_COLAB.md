@@ -65,6 +65,69 @@ analysis** (the same discipline as `a59182d`). Adapters stay on Drive under
 
 Never download the Colab notebook back over `exp1_gpu.ipynb`.
 
+---
+
+# Runbook — finish RUT at 0.5B on Colab (keep 0.5 cells)
+
+The laptop RUT run (`results/auditor_rut_0.5B.json`) was stopped after its 4
+keep-0.75 cells. The 4 keep-0.5 cells run here instead, **on the same hollow
+models** the oracle and MET evaluated: the laptop's factor cache and its saved
+keep-0.5 adapters are uploaded, so nothing is retrained.
+
+## 1. Upload (once)
+
+From `colab_upload/` in this repo (made locally, gitignored), upload to
+**MyDrive/effortgap_upload/**:
+
+* `effortgap_0.5B_for_colab.zip` (1.9 GB — factor cache + adapters)
+* `exp1_gpu_src.py`, `auditor.py`, `auditor_met.py`, `auditor_rut.py`
+
+## 2. Runtime
+
+New notebook → Runtime → Change runtime type → **T4 GPU**.
+
+## 3. Cells
+
+```python
+!pip -q install "transformers>=4.44" datasets accelerate peft safetensors
+```
+
+```python
+from google.colab import drive
+drive.mount("/content/drive")
+!cp /content/drive/MyDrive/effortgap_upload/*.py /content/
+!cd /content && unzip -q -o /content/drive/MyDrive/effortgap_upload/effortgap_0.5B_for_colab.zip
+```
+
+```python
+import sys, torch; sys.path.insert(0, "/content")
+from dataclasses import replace
+import exp1_gpu_src as E, auditor_rut
+
+# fp32 weights, as on the laptop: the first 4 cells were fp32, and mixing
+# bf16 into the same table would add a dtype confound inside one auditor.
+E.DTYPE = torch.float32
+
+cfg = replace(E.CFG_0_5B_MATCHED, ratios=(0.5,),
+              adapter_dir="/content/effortgap/adapters")
+auditor_rut.run(cfg, out="/content/drive/MyDrive/effortgap/auditor_rut_0.5B_keep0.5.json",
+                methods=("act_aware_greedy",), floors=(0.25,))
+```
+
+Expect the log to say `factors already cached ... skipping calibration pass`
+and to find adapters for `B_calib = [0, 100, 300, 500]`. If instead it raises
+"trained on a different rank assignment", the cache did not unzip to
+`/content/effortgap/` — check the paths, do not work around the check.
+
+Budget ~30–60 min on a T4 (it regenerates the 2 500 + 900 reference responses
+first).
+
+## 4. Bring back
+
+`MyDrive/effortgap/auditor_rut_0.5B_keep0.5.json` → `results/`, committed
+unmodified. The reference pools differ from the laptop run's (fresh draws), so
+the two files are reported side by side, not merged into one table.
+
 ## Afterwards
 
 * `auditor.run(E.CFG_IMPROVE, out="results/auditor_oracle_1.5B.json")` on the

@@ -16,3 +16,6 @@ __pycache__/
 # experiment outputs the findings-*.md files cite.
 effortgap/
 effortgap_*/
+
+# bundle for uploading the 0.5B cache + adapters to Colab (regenerable)
+colab_upload/
