@@ -121,6 +121,29 @@ The truncation rows are deterministic and should reproduce exactly. The
 `B_calib>0` rows move by a percent or so between runs because LoRA dropout is
 unseeded.
 
+### Runs that fit on the laptop (Run 4 and the auditors)
+
+The module is importable without running any experiment cell, so single runs
+are one-liners. Run 4 (0.5B under `CFG_1_5B`, ~85 min on an M1) and the W2
+auditors at 0.5B (oracle ~2 h, MET ~1 h with the batched sampler):
+
+```sh
+HF_HUB_OFFLINE=1 .venv/bin/python -c "import exp1_gpu_src as E; r={}; E.run_model(E.CFG_0_5B_MATCHED, r, E.out_for(E.CFG_0_5B_MATCHED))"
+```
+
+```python
+from dataclasses import replace
+import exp1_gpu_src as E, auditor, auditor_met
+cfg = replace(E.CFG_0_5B_MATCHED, ratios=(0.75, 0.5))
+auditor.run(cfg, out="results/auditor_oracle_0.5B.json", epsilons=(1.0,),
+            methods=("act_aware_greedy",), floors=(0.25,), m_prompts=auditor_met.M_PROMPTS)
+auditor_met.run(cfg, out="results/auditor_met_0.5B.json",
+                methods=("act_aware_greedy",), floors=(0.25,))
+```
+
+The auditors need Run 4's factor cache and adapters (written to `effortgap/`,
+gitignored), so run Run 4 first. Run 3 needs a GPU: see `RUNBOOK_COLAB.md`.
+
 ### Where the cache goes
 
 Scratch paths resolve at import, in this order:

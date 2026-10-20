@@ -36,9 +36,9 @@ Protocol constraints inherited from the pre-registration (proposal.md, 66cc0d8)
 
 Scope
 -----
-Measurement only, no training. Runs on Colab beside the experiment notebook;
-it will not run on a laptop (needs the calibration pass and two resident
-models).
+Measurement only, no training. At 1.5B it runs on Colab beside the experiment
+notebook (calibration pass plus two resident models). At 0.5B it fits an 8 GB
+laptop in fp32 -- ~15 min per (arm, B_calib) cell with the batched sampler.
 
 Usage
 -----
@@ -298,7 +298,15 @@ def _response_logprob(model, prompts: torch.Tensor, toks: torch.Tensor,
 @torch.no_grad()
 def _llr_samples(ref, hollow, prompts, device, n_draws: int,
                  from_hollow: bool, epsilon: float, gen) -> torch.Tensor:
-    """Per-response log-likelihood ratios log p_ref(y) - log p_hollow(y).
+    """Per-response log-likelihood ratios log p_hollow(y) - log p_ref(y).
+
+    Oriented so that LARGE values are evidence for the alternative (hollow),
+    which is the direction `oracle_power` rejects in. Its mean is
+    -KL(ref || hollow) per response under the null and +KL(hollow || ref)
+    under the alternative. (An earlier version returned the opposite sign
+    while `oracle_power` rejected on large values, i.e. it tested in the wrong
+    tail and reported power 0 at KL ~1 nat/token. `_check_orientation` now
+    guards against that.)
 
     `from_hollow=False` draws the null (target is honest); True draws the
     alternative. `epsilon` is the fractional-dilution adversary of section 3:
@@ -325,11 +333,29 @@ def _llr_samples(ref, hollow, prompts, device, n_draws: int,
                 toks[sel] = _sample_exact_batch(src, P[pidx[sel]], RESP_TOKENS,
                                                 device, gen)
         pr = P[pidx]
-        out[a:a + b] = (_response_logprob(ref, pr, toks, device)
-                        - _response_logprob(hollow, pr, toks, device))
+        out[a:a + b] = (_response_logprob(hollow, pr, toks, device)
+                        - _response_logprob(ref, pr, toks, device))
         log(f"    llr draw {a + b}/{n_draws} ({'alt' if from_hollow else 'null'})")
         sweep()
     return out
+
+
+def _check_orientation(null_llr: torch.Tensor, alt_llr: torch.Tensor,
+                       kl_per_token: float) -> None:
+    """Refuse to report power from a statistic pointing the wrong way.
+
+    With LLR = log p_hollow - log p_ref, the null mean is -KL(ref||hollow) <= 0
+    and the alternative mean is +KL(hollow||ref) >= 0. If the models differ
+    measurably and the sample means do not straddle zero in that order, the
+    sign convention is broken somewhere and every power figure is meaningless.
+    """
+    if kl_per_token * RESP_TOKENS < 0.1:     # models ~identical: nothing to check
+        return
+    if not (float(null_llr.mean()) < 0 < float(alt_llr.mean())):
+        raise AssertionError(
+            f"LLR orientation check failed: null mean {float(null_llr.mean()):.3f}, "
+            f"alt mean {float(alt_llr.mean()):.3f}, KL/token {kl_per_token:.4f}. "
+            "Expected null < 0 < alt.")
 
 
 def oracle_power(null_llr: torch.Tensor, alt_llr: torch.Tensor,
@@ -440,7 +466,17 @@ def _oracle_one(rows: List[Dict], cfg: Cfg, cache: Cache, shapes, svals,
                             N_NULL_DRAWS, False, eps, gen)
         alt = _llr_samples(ref, hollow, prompts, DEV,
                            N_ALT_DRAWS, True, eps, gen)
+        _check_orientation(null, alt, kl["kl_exact_per_token"])
         power = oracle_power(null, alt, gen=gen)
+        # Finite-pool calibration. Both sums are bootstrapped from ~200 draws,
+        # so at large N the chance difference between two pools' means gets
+        # amplified by sqrt(N) and reads as power: on synthetic identical
+        # distributions this "level" is ~0.01 at N=1 but ~0.08 at N=100 and
+        # ~0.5 at N=1000. Measure it here, null half against null half, so a
+        # reader can see at which N the power figure is resolved and at which
+        # it is pool noise.
+        h = len(null) // 2
+        pool_fp = oracle_power(null[:h], null[h:], gen=gen)
         n_emp = queries_to_detection(power)
         n_pred = n_star_chernoff_stein(kl["kl_exact_per_token"])
         rows.append({
@@ -451,6 +487,7 @@ def _oracle_one(rows: List[Dict], cfg: Cfg, cache: Cache, shapes, svals,
             "epsilon": eps,
             **kl,
             "power_at_N": power,
+            "pool_false_positive_at_N": pool_fp,
             "n_star_empirical": n_emp,
             "n_star_predicted": n_pred,
             "empirical_over_predicted":
